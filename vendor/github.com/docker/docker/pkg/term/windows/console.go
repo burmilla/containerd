@@ -9,9 +9,10 @@ import (
 
 	"github.com/Azure/go-ansiterm/winterm"
 
-	ansiterm "github.com/Azure/go-ansiterm"
-	"github.com/Sirupsen/logrus"
 	"io/ioutil"
+
+	ansiterm "github.com/Azure/go-ansiterm"
+	"github.com/sirupsen/logrus"
 )
 
 // ConEmuStreams returns prepared versions of console streams,
