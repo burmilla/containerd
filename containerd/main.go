@@ -13,9 +13,8 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/codegangsta/cli"
-	"github.com/cyberdelia/go-metrics-graphite"
+	graphite "github.com/cyberdelia/go-metrics-graphite"
 	"github.com/docker/containerd"
 	"github.com/docker/containerd/api/grpc/server"
 	"github.com/docker/containerd/api/grpc/types"
@@ -24,6 +23,7 @@ import (
 	"github.com/docker/containerd/supervisor"
 	"github.com/docker/docker/pkg/listeners"
 	"github.com/rcrowley/go-metrics"
+	"github.com/sirupsen/logrus"
 )
 
 const (
