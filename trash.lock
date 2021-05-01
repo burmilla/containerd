@@ -3,8 +3,6 @@ import:
   version: 70b2c90b260171e829f1ebd7c17f600c11858dbe
 - package: github.com/Microsoft/go-winio
   version: v0.3.2
-- package: github.com/Sirupsen/logrus
-  version: 4b6ea7319e214d98c938f12692336f7ca9348d6b
 - package: github.com/cloudfoundry/gosigar
   version: 3ed7c74352dae6dc00bdc8c74045375352e3ec05
 - package: github.com/codegangsta/cli
@@ -34,6 +32,8 @@ import:
   version: eeba7bd0dd01ace6e690fa833b3f22aaec29af43
 - package: github.com/seccomp/libseccomp-golang
   version: 1b506fc7c24eec5a3693cdcbed40d9c226cfc6a1
+- package: github.com/sirupsen/logrus
+  version: v1.8.1
 - package: github.com/syndtr/gocapability
   version: 2c00daeb6c3b45114c80ac44119e7b8801fdd852
 - package: github.com/vdemeester/shakers
