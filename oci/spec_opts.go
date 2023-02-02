@@ -442,27 +442,16 @@ func WithImageConfigArgs(image Image, args []string) SpecOpts {
 			// combined (potentially overwriting Cmd with User Args if present)
 			// and forwarded the container start as an Args array.
 			cmd := config.Cmd
-			cmdFromImage := true
 			if len(args) > 0 {
 				cmd = args
-				cmdFromImage = false
 			}
 
 			cmd = append(config.Entrypoint, cmd...)
 			if len(cmd) == 0 {
 				return errors.New("no arguments specified")
 			}
-
-			if config.ArgsEscaped && (len(config.Entrypoint) > 0 || cmdFromImage) {
-				s.Process.Args = nil
-				s.Process.CommandLine = cmd[0]
-				if len(cmd) > 1 {
-					s.Process.CommandLine += " " + escapeAndCombineArgs(cmd[1:])
-				}
-			} else {
-				s.Process.Args = cmd
-				s.Process.CommandLine = ""
-			}
+			s.Process.Args = cmd
+			s.Process.CommandLine = ""
 
 			s.Process.Cwd = config.WorkingDir
 			s.Process.User = specs.User{
