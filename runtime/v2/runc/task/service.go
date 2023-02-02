@@ -24,9 +24,9 @@ import (
 	"os"
 	"sync"
 
-	"github.com/containerd/cgroups/v3"
-	"github.com/containerd/cgroups/v3/cgroup1"
-	cgroupsv2 "github.com/containerd/cgroups/v3/cgroup2"
+	"github.com/containerd/cgroups"
+	"github.com/containerd/cgroups/cgroup1"
+	cgroupsv2 "github.com/containerd/cgroups/cgroup2"
 	eventstypes "github.com/containerd/containerd/api/events"
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/containerd/api/types/task"

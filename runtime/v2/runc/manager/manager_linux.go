@@ -26,9 +26,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containerd/cgroups/v3"
-	"github.com/containerd/cgroups/v3/cgroup1"
-	cgroupsv2 "github.com/containerd/cgroups/v3/cgroup2"
+	"github.com/containerd/cgroups"
+	"github.com/containerd/cgroups/cgroup1"
+	cgroupsv2 "github.com/containerd/cgroups/cgroup2"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"

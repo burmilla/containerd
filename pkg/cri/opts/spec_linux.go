@@ -27,8 +27,8 @@ import (
 	"syscall"
 
 	"github.com/container-orchestrated-devices/container-device-interface/pkg/cdi"
-	"github.com/containerd/cgroups/v3"
-	"github.com/containerd/cgroups/v3/cgroup1"
+	"github.com/containerd/cgroups"
+	"github.com/containerd/cgroups/cgroup1"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 

@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"syscall"
 
-	"github.com/containerd/cgroups/v3/cgroup1"
+	"github.com/containerd/cgroups/cgroup1"
 	exec "golang.org/x/sys/execabs"
 )
 

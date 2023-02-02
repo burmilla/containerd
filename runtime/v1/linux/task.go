@@ -24,7 +24,7 @@ import (
 	"fmt"
 	"sync"
 
-	cgroups "github.com/containerd/cgroups/v3/cgroup1"
+	cgroups "github.com/containerd/cgroups/cgroup1"
 	eventstypes "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/events/exchange"
