@@ -6,7 +6,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/docker/containerd/osutils"
+	"github.com/containerd/containerd/osutils"
 	"github.com/sirupsen/logrus"
 )
 

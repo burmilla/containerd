@@ -3,7 +3,7 @@ package supervisor
 import (
 	"time"
 
-	"github.com/docker/containerd/runtime"
+	"github.com/containerd/containerd/runtime"
 )
 
 type UpdateTask struct {

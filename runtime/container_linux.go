@@ -9,8 +9,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/docker/containerd/specs"
-	"github.com/docker/containerd/subreaper/exec"
+	"github.com/containerd/containerd/specs"
+	"github.com/containerd/containerd/subreaper/exec"
 	"github.com/opencontainers/runc/libcontainer"
 	ocs "github.com/opencontainers/runtime-spec/specs-go"
 )

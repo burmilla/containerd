@@ -10,9 +10,9 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/docker/containerd/specs"
-	"github.com/docker/containerd/subreaper"
-	"github.com/docker/containerd/subreaper/exec"
+	"github.com/containerd/containerd/specs"
+	"github.com/containerd/containerd/subreaper"
+	"github.com/containerd/containerd/subreaper/exec"
 	"github.com/docker/docker/pkg/term"
 	"github.com/opencontainers/runc/libcontainer"
 )

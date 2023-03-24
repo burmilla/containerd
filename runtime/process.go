@@ -11,8 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/docker/containerd/specs"
-	"github.com/docker/containerd/subreaper/exec"
+	"github.com/containerd/containerd/specs"
+	"github.com/containerd/containerd/subreaper/exec"
 	"golang.org/x/sys/unix"
 )
 

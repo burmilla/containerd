@@ -5,7 +5,7 @@ import (
 	osExec "os/exec"
 	"strconv"
 
-	"github.com/docker/containerd/subreaper"
+	"github.com/containerd/containerd/subreaper"
 )
 
 var ErrNotFound = osExec.ErrNotFound

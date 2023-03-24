@@ -8,8 +8,8 @@ import (
 	netcontext "golang.org/x/net/context"
 
 	"github.com/codegangsta/cli"
-	"github.com/docker/containerd"
-	"github.com/docker/containerd/api/grpc/types"
+	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/api/grpc/types"
 	"github.com/sirupsen/logrus"
 )
 

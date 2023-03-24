@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/containerd/api/grpc/types"
+	"github.com/containerd/containerd/api/grpc/types"
 	"github.com/sirupsen/logrus"
 	netcontext "golang.org/x/net/context"
 	"google.golang.org/grpc"

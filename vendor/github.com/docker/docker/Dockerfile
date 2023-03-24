@@ -264,8 +264,8 @@ RUN set -x \
 ENV CONTAINERD_COMMIT v0.2.1
 RUN set -x \
 	&& export GOPATH="$(mktemp -d)" \
-	&& git clone https://github.com/docker/containerd.git "$GOPATH/src/github.com/docker/containerd" \
-	&& cd "$GOPATH/src/github.com/docker/containerd" \
+	&& git clone https://github.com/containerd/containerd.git "$GOPATH/src/github.com/containerd/containerd" \
+	&& cd "$GOPATH/src/github.com/containerd/containerd" \
 	&& git checkout -q "$CONTAINERD_COMMIT" \
 	&& make static \
 	&& cp bin/containerd /usr/local/bin/docker-containerd \

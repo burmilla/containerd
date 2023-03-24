@@ -19,8 +19,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/grpclog"
 
-	"github.com/docker/containerd/api/grpc/types"
-	utils "github.com/docker/containerd/testutils"
+	"github.com/containerd/containerd/api/grpc/types"
+	utils "github.com/containerd/containerd/testutils"
 	"github.com/go-check/check"
 )
 

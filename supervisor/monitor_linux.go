@@ -4,8 +4,8 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/docker/containerd/archutils"
-	"github.com/docker/containerd/runtime"
+	"github.com/containerd/containerd/archutils"
+	"github.com/containerd/containerd/runtime"
 	"github.com/sirupsen/logrus"
 )
 

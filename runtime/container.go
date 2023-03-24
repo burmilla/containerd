@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/docker/containerd/specs"
-	"github.com/docker/containerd/subreaper/exec"
+	"github.com/containerd/containerd/specs"
+	"github.com/containerd/containerd/subreaper/exec"
 	ocs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 )

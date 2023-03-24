@@ -3,7 +3,7 @@ package runtime
 import (
 	"errors"
 
-	"github.com/docker/containerd/specs"
+	"github.com/containerd/containerd/specs"
 )
 
 func (c *container) OOM() (OOM, error) {

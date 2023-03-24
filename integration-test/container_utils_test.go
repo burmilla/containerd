@@ -9,7 +9,7 @@ import (
 	"sort"
 	"syscall"
 
-	"github.com/docker/containerd/api/grpc/types"
+	"github.com/containerd/containerd/api/grpc/types"
 	"golang.org/x/net/context"
 )
 

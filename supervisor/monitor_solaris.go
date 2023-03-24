@@ -3,7 +3,7 @@ package supervisor
 import (
 	"errors"
 
-	"github.com/docker/containerd/runtime"
+	"github.com/containerd/containerd/runtime"
 )
 
 func NewMonitor() (*Monitor, error) {

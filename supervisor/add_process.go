@@ -3,8 +3,8 @@ package supervisor
 import (
 	"time"
 
-	"github.com/docker/containerd/runtime"
-	"github.com/docker/containerd/specs"
+	"github.com/containerd/containerd/runtime"
+	"github.com/containerd/containerd/specs"
 )
 
 type AddProcessTask struct {

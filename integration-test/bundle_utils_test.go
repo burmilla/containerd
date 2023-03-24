@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 
-	utils "github.com/docker/containerd/testutils"
+	utils "github.com/containerd/containerd/testutils"
 	ocs "github.com/opencontainers/runtime-spec/specs-go"
 )
 

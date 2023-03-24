@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/containerd/runtime"
+	"github.com/containerd/containerd/runtime"
 	"github.com/sirupsen/logrus"
 )
 

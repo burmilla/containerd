@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/codegangsta/cli"
-	"github.com/docker/containerd/api/grpc/types"
-	"github.com/docker/containerd/specs"
+	"github.com/containerd/containerd/api/grpc/types"
+	"github.com/containerd/containerd/specs"
 	"github.com/docker/docker/pkg/term"
 	netcontext "golang.org/x/net/context"
 	"google.golang.org/grpc"

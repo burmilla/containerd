@@ -2,7 +2,7 @@
 
 package supervisor
 
-import "github.com/docker/containerd/runtime"
+import "github.com/containerd/containerd/runtime"
 
 type CreateCheckpointTask struct {
 	baseTask

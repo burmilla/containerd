@@ -42,7 +42,7 @@ be found.
 
 ## 1.11.0 (2016-04-13)
 
-**IMPORTANT**: With Docker 1.11, a Linux docker installation is now made of 4 binaries (`docker`, [`docker-containerd`](https://github.com/docker/containerd), [`docker-containerd-shim`](https://github.com/docker/containerd) and [`docker-runc`](https://github.com/opencontainers/runc)). If you have scripts relying on docker being a single static binaries, please make sure to update them. Interaction with the daemon stay the same otherwise, the usage of the other binaries should be transparent. A Windows docker installation remains a single binary, `docker.exe`.
+**IMPORTANT**: With Docker 1.11, a Linux docker installation is now made of 4 binaries (`docker`, [`docker-containerd`](https://github.com/containerd/containerd), [`docker-containerd-shim`](https://github.com/containerd/containerd) and [`docker-runc`](https://github.com/opencontainers/runc)). If you have scripts relying on docker being a single static binaries, please make sure to update them. Interaction with the daemon stay the same otherwise, the usage of the other binaries should be transparent. A Windows docker installation remains a single binary, `docker.exe`.
 
 ### Builder
 
@@ -165,7 +165,7 @@ be found.
 * The devmapper driver learned the `dm.min_free_space` option. If the mapped device free space reaches the passed value, new device creation will be prohibited. ([#20786](https://github.com/docker/docker/pull/20786))
 + Docker can now prevent processes in container to gain new privileges via the `--security-opt=no-new-privileges` flag ([#20727](https://github.com/docker/docker/pull/20727))
 - Starting a container with the `--device` option will now correctly resolves symlinks ([#20684](https://github.com/docker/docker/pull/20684))
-+ Docker now relies on [`containerd`](https://github.com/docker/containerd) and [`runc`](https://github.com/opencontainers/runc) to spawn containers. ([#20662](https://github.com/docker/docker/pull/20662))
++ Docker now relies on [`containerd`](https://github.com/containerd/containerd) and [`runc`](https://github.com/opencontainers/runc) to spawn containers. ([#20662](https://github.com/docker/docker/pull/20662))
 - Fix docker configuration reloading to only alter value present in the given config file ([#20604](https://github.com/docker/docker/pull/20604))
 + Docker now allows setting a container hostname via the `--hostname` flag when `--net=host` ([#20177](https://github.com/docker/docker/pull/20177))
 + Docker now allows executing privileged container while running with `--userns-remap` if both `--privileged` and the new `--userns=host` flag are specified ([#20111](https://github.com/docker/docker/pull/20111))
