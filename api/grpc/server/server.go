@@ -327,67 +327,7 @@ func (s *apiServer) Events(r *types.EventsRequest, stream types.API_EventsServer
 
 func convertToPb(st *runtime.Stat) *types.StatsResponse {
 	pbSt := &types.StatsResponse{
-		Timestamp:   uint64(st.Timestamp.Unix()),
-		CgroupStats: &types.CgroupStats{},
-	}
-	systemUsage, _ := getSystemCPUUsage()
-	pbSt.CgroupStats.CpuStats = &types.CpuStats{
-		CpuUsage: &types.CpuUsage{
-			TotalUsage:        st.Cpu.Usage.Total,
-			PercpuUsage:       st.Cpu.Usage.Percpu,
-			UsageInKernelmode: st.Cpu.Usage.Kernel,
-			UsageInUsermode:   st.Cpu.Usage.User,
-		},
-		ThrottlingData: &types.ThrottlingData{
-			Periods:          st.Cpu.Throttling.Periods,
-			ThrottledPeriods: st.Cpu.Throttling.ThrottledPeriods,
-			ThrottledTime:    st.Cpu.Throttling.ThrottledTime,
-		},
-		SystemUsage: systemUsage,
-	}
-	pbSt.CgroupStats.MemoryStats = &types.MemoryStats{
-		Cache: st.Memory.Cache,
-		Usage: &types.MemoryData{
-			Usage:    st.Memory.Usage.Usage,
-			MaxUsage: st.Memory.Usage.Max,
-			Failcnt:  st.Memory.Usage.Failcnt,
-			Limit:    st.Memory.Usage.Limit,
-		},
-		SwapUsage: &types.MemoryData{
-			Usage:    st.Memory.Swap.Usage,
-			MaxUsage: st.Memory.Swap.Max,
-			Failcnt:  st.Memory.Swap.Failcnt,
-			Limit:    st.Memory.Swap.Limit,
-		},
-		KernelUsage: &types.MemoryData{
-			Usage:    st.Memory.Kernel.Usage,
-			MaxUsage: st.Memory.Kernel.Max,
-			Failcnt:  st.Memory.Kernel.Failcnt,
-			Limit:    st.Memory.Kernel.Limit,
-		},
-		Stats: st.Memory.Raw,
-	}
-	pbSt.CgroupStats.BlkioStats = &types.BlkioStats{
-		IoServiceBytesRecursive: convertBlkioEntryToPb(st.Blkio.IoServiceBytesRecursive),
-		IoServicedRecursive:     convertBlkioEntryToPb(st.Blkio.IoServicedRecursive),
-		IoQueuedRecursive:       convertBlkioEntryToPb(st.Blkio.IoQueuedRecursive),
-		IoServiceTimeRecursive:  convertBlkioEntryToPb(st.Blkio.IoServiceTimeRecursive),
-		IoWaitTimeRecursive:     convertBlkioEntryToPb(st.Blkio.IoWaitTimeRecursive),
-		IoMergedRecursive:       convertBlkioEntryToPb(st.Blkio.IoMergedRecursive),
-		IoTimeRecursive:         convertBlkioEntryToPb(st.Blkio.IoTimeRecursive),
-		SectorsRecursive:        convertBlkioEntryToPb(st.Blkio.SectorsRecursive),
-	}
-	pbSt.CgroupStats.HugetlbStats = make(map[string]*types.HugetlbStats)
-	for k, st := range st.Hugetlb {
-		pbSt.CgroupStats.HugetlbStats[k] = &types.HugetlbStats{
-			Usage:    st.Usage,
-			MaxUsage: st.Max,
-			Failcnt:  st.Failcnt,
-		}
-	}
-	pbSt.CgroupStats.PidsStats = &types.PidsStats{
-		Current: st.Pids.Current,
-		Limit:   st.Pids.Limit,
+		Timestamp: uint64(st.Timestamp.Unix()),
 	}
 	return pbSt
 }

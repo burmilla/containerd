@@ -52,11 +52,6 @@ func (w *worker) Start() {
 			w.s.SendTask(evt)
 			continue
 		}
-		if err := w.s.monitor.MonitorOOM(t.Container); err != nil && err != runtime.ErrContainerExited {
-			if process.State() != runtime.Stopped {
-				logrus.WithField("error", err).Error("containerd: notify OOM events")
-			}
-		}
 		if err := w.s.monitorProcess(process); err != nil {
 			logrus.WithField("error", err).Error("containerd: add process to monitor")
 		}

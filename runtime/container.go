@@ -51,8 +51,6 @@ type Container interface {
 	Stats() (*Stat, error)
 	// Name or path of the OCI compliant runtime used to execute the container
 	Runtime() string
-	// OOM signals the channel if the container received an OOM notification
-	OOM() (OOM, error)
 	// UpdateResource updates the containers resources to new values
 	UpdateResources(*Resource) error
 
@@ -501,13 +499,7 @@ func (c *container) Status() (State, error) {
 }
 
 func (c *container) writeEventFD(root string, cfd, efd int) error {
-	f, err := os.OpenFile(filepath.Join(root, "cgroup.event_control"), os.O_WRONLY, 0)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = f.WriteString(fmt.Sprintf("%d %d", efd, cfd))
-	return err
+	return nil
 }
 
 func (c *container) newProcess(config *processConfig) (Process, error) {
@@ -554,8 +546,7 @@ func (o *oom) Flush() {
 }
 
 func (o *oom) Removed() bool {
-	_, err := os.Lstat(filepath.Join(o.root, "cgroup.event_control"))
-	return os.IsNotExist(err)
+	return true
 }
 
 func (o *oom) Close() error {

@@ -49,7 +49,6 @@ It has these top-level messages:
 	BlkioStatsEntry
 	BlkioStats
 	HugetlbStats
-	CgroupStats
 	StatsResponse
 	StatsRequest
 */
@@ -723,57 +722,8 @@ func (m *HugetlbStats) String() string            { return proto.CompactTextStri
 func (*HugetlbStats) ProtoMessage()               {}
 func (*HugetlbStats) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{39} }
 
-type CgroupStats struct {
-	CpuStats     *CpuStats                `protobuf:"bytes,1,opt,name=cpu_stats" json:"cpu_stats,omitempty"`
-	MemoryStats  *MemoryStats             `protobuf:"bytes,2,opt,name=memory_stats" json:"memory_stats,omitempty"`
-	BlkioStats   *BlkioStats              `protobuf:"bytes,3,opt,name=blkio_stats" json:"blkio_stats,omitempty"`
-	HugetlbStats map[string]*HugetlbStats `protobuf:"bytes,4,rep,name=hugetlb_stats" json:"hugetlb_stats,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	PidsStats    *PidsStats               `protobuf:"bytes,5,opt,name=pids_stats" json:"pids_stats,omitempty"`
-}
-
-func (m *CgroupStats) Reset()                    { *m = CgroupStats{} }
-func (m *CgroupStats) String() string            { return proto.CompactTextString(m) }
-func (*CgroupStats) ProtoMessage()               {}
-func (*CgroupStats) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{40} }
-
-func (m *CgroupStats) GetCpuStats() *CpuStats {
-	if m != nil {
-		return m.CpuStats
-	}
-	return nil
-}
-
-func (m *CgroupStats) GetMemoryStats() *MemoryStats {
-	if m != nil {
-		return m.MemoryStats
-	}
-	return nil
-}
-
-func (m *CgroupStats) GetBlkioStats() *BlkioStats {
-	if m != nil {
-		return m.BlkioStats
-	}
-	return nil
-}
-
-func (m *CgroupStats) GetHugetlbStats() map[string]*HugetlbStats {
-	if m != nil {
-		return m.HugetlbStats
-	}
-	return nil
-}
-
-func (m *CgroupStats) GetPidsStats() *PidsStats {
-	if m != nil {
-		return m.PidsStats
-	}
-	return nil
-}
-
 type StatsResponse struct {
 	NetworkStats []*NetworkStats `protobuf:"bytes,1,rep,name=network_stats" json:"network_stats,omitempty"`
-	CgroupStats  *CgroupStats    `protobuf:"bytes,2,opt,name=cgroup_stats" json:"cgroup_stats,omitempty"`
 	Timestamp    uint64          `protobuf:"varint,3,opt,name=timestamp" json:"timestamp,omitempty"`
 }
 
@@ -785,13 +735,6 @@ func (*StatsResponse) Descriptor() ([]byte, []int) { return fileDescriptor0, []i
 func (m *StatsResponse) GetNetworkStats() []*NetworkStats {
 	if m != nil {
 		return m.NetworkStats
-	}
-	return nil
-}
-
-func (m *StatsResponse) GetCgroupStats() *CgroupStats {
-	if m != nil {
-		return m.CgroupStats
 	}
 	return nil
 }
@@ -846,7 +789,6 @@ func init() {
 	proto.RegisterType((*BlkioStatsEntry)(nil), "types.BlkioStatsEntry")
 	proto.RegisterType((*BlkioStats)(nil), "types.BlkioStats")
 	proto.RegisterType((*HugetlbStats)(nil), "types.HugetlbStats")
-	proto.RegisterType((*CgroupStats)(nil), "types.CgroupStats")
 	proto.RegisterType((*StatsResponse)(nil), "types.StatsResponse")
 	proto.RegisterType((*StatsRequest)(nil), "types.StatsRequest")
 }

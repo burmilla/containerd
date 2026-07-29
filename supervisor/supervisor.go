@@ -317,9 +317,6 @@ func (s *Supervisor) restore() error {
 		s.containers[id] = &containerInfo{
 			container: container,
 		}
-		if err := s.monitor.MonitorOOM(container); err != nil && err != runtime.ErrContainerExited {
-			logrus.WithField("error", err).Error("containerd: notify OOM events")
-		}
 		logrus.WithField("id", id).Debug("containerd: container restored")
 		var exitedProcesses []runtime.Process
 		for _, p := range processes {

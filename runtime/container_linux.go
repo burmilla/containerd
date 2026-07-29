@@ -4,10 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/docker/containerd/specs"
 	"github.com/docker/containerd/subreaper/exec"
@@ -26,31 +23,11 @@ func (c *container) getLibctContainer() (libcontainer.Container, error) {
 		}
 	}
 
-	f, err := libcontainer.New(runtimeRoot, libcontainer.Cgroupfs)
+	f, err := libcontainer.New(runtimeRoot)
 	if err != nil {
 		return nil, err
 	}
 	return f.Load(c.id)
-}
-
-func (c *container) OOM() (OOM, error) {
-	container, err := c.getLibctContainer()
-	if err != nil {
-		if lerr, ok := err.(libcontainer.Error); ok {
-			// with oom registration sometimes the container can run, exit, and be destroyed
-			// faster than we can get the state back so we can just ignore this
-			if lerr.Code() == libcontainer.ContainerNotExists {
-				return nil, ErrContainerExited
-			}
-		}
-		return nil, err
-	}
-	state, err := container.State()
-	if err != nil {
-		return nil, err
-	}
-	memoryPath := state.CgroupPaths["memory"]
-	return c.getMemeoryEventFD(memoryPath)
 }
 
 func u64Ptr(i uint64) *uint64 { return &i }
@@ -108,27 +85,4 @@ func getRootIDs(s *specs.Spec) (int, int, error) {
 	uid := hostIDFromMap(0, s.Linux.UIDMappings)
 	gid := hostIDFromMap(0, s.Linux.GIDMappings)
 	return uid, gid, nil
-}
-
-func (c *container) getMemeoryEventFD(root string) (*oom, error) {
-	f, err := os.Open(filepath.Join(root, "memory.oom_control"))
-	if err != nil {
-		return nil, err
-	}
-	fd, _, serr := syscall.RawSyscall(syscall.SYS_EVENTFD2, 0, syscall.FD_CLOEXEC, 0)
-	if serr != 0 {
-		f.Close()
-		return nil, serr
-	}
-	if err := c.writeEventFD(root, int(f.Fd()), int(fd)); err != nil {
-		syscall.Close(int(fd))
-		f.Close()
-		return nil, err
-	}
-	return &oom{
-		root:    root,
-		id:      c.id,
-		eventfd: int(fd),
-		control: f,
-	}, nil
 }

@@ -56,26 +56,6 @@ func (m *Monitor) Monitor(p runtime.Process) error {
 	return nil
 }
 
-func (m *Monitor) MonitorOOM(c runtime.Container) error {
-	m.m.Lock()
-	defer m.m.Unlock()
-	o, err := c.OOM()
-	if err != nil {
-		return err
-	}
-	fd := o.FD()
-	event := syscall.EpollEvent{
-		Fd:     int32(fd),
-		Events: syscall.EPOLLHUP | syscall.EPOLLIN,
-	}
-	if err := archutils.EpollCtl(m.epollFd, syscall.EPOLL_CTL_ADD, fd, &event); err != nil {
-		return err
-	}
-	EpollFdCounter.Inc(1)
-	m.receivers[fd] = o
-	return nil
-}
-
 func (m *Monitor) Close() error {
 	return syscall.Close(m.epollFd)
 }
