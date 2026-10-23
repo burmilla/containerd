@@ -11,6 +11,9 @@ var (
 	// ErrContainerExited is returned when access to an exited
 	// container is attempted
 	ErrContainerExited = errors.New("containerd: container has exited")
+	// ErrOOMNotSupported is returned when the kernel offers no cgroup v1
+	// memory event file for the container (cgroup v2, or no cgroups at all)
+	ErrOOMNotSupported = errors.New("containerd: OOM notification not supported")
 	// ErrProcessNotExited is returned when trying to retrieve the exit
 	// status of an alive process
 	ErrProcessNotExited = errors.New("containerd: process has not exited")

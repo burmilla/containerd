@@ -343,7 +343,7 @@ func (s *Supervisor) restore() error {
 		s.containers[id] = &containerInfo{
 			container: container,
 		}
-		if err := s.monitor.MonitorOOM(container); err != nil && err != runtime.ErrContainerExited {
+		if err := s.monitor.MonitorOOM(container); err != nil && err != runtime.ErrContainerExited && err != runtime.ErrOOMNotSupported {
 			logrus.WithField("error", err).Error("containerd: notify OOM events")
 		}
 

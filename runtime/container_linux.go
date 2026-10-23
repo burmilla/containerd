@@ -72,7 +72,7 @@ func (c *container) OOM() (OOM, error) {
 
 	mountpoint, hostRoot, err := findCgroupMountpointAndRoot(os.Getpid(), "memory")
 	if err != nil {
-		return nil, err
+		return nil, ErrOOMNotSupported
 	}
 
 	cgroups, err := parseCgroupFile(fmt.Sprintf("/proc/%d/cgroup", p.pid))
@@ -82,7 +82,7 @@ func (c *container) OOM() (OOM, error) {
 
 	root, ok := cgroups["memory"]
 	if !ok {
-		return nil, fmt.Errorf("no memory cgroup for container %s", c.ID())
+		return nil, ErrOOMNotSupported
 	}
 
 	// Take care of the case were we're running inside a container
@@ -98,6 +98,12 @@ func (c *container) Pids() ([]int, error) {
 	args = append(args, "ps", "--format=json", c.id)
 	out, err := exec.Command(c.runtime, args...).CombinedOutput()
 	if err != nil {
+		// A runtime running without cgroups (crun --cgroup-manager=disabled)
+		// cannot list the container's processes. Fall back to the init
+		// process, which is all the daemon needs to restore the container.
+		if p := c.processes[InitProcessID]; p != nil && p.State() != Stopped {
+			return []int{p.pid}, nil
+		}
 		return nil, fmt.Errorf("%s: %q", err.Error(), out)
 	}
 	if err := json.Unmarshal(out, &pids); err != nil {
