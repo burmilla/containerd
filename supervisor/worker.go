@@ -4,10 +4,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/containerd/runtime"
-	"github.com/sirupsen/logrus"
+	"github.com/Sirupsen/logrus"
+	"github.com/containerd/containerd/runtime"
+	"golang.org/x/net/context"
 )
 
+// Worker interface
 type Worker interface {
 	Start()
 }
@@ -20,8 +22,10 @@ type startTask struct {
 	Stderr         string
 	Err            chan error
 	StartResponse  chan StartResponse
+	Ctx            context.Context
 }
 
+// NewWorker return a new initialized worker
 func NewWorker(s *Supervisor, wg *sync.WaitGroup) Worker {
 	return &worker{
 		s:  s,
@@ -34,11 +38,12 @@ type worker struct {
 	s  *Supervisor
 }
 
+// Start runs a loop in charge of starting new containers
 func (w *worker) Start() {
 	defer w.wg.Done()
 	for t := range w.s.startTasks {
 		started := time.Now()
-		process, err := t.Container.Start(t.CheckpointPath, runtime.NewStdio(t.Stdin, t.Stdout, t.Stderr))
+		process, err := t.Container.Start(t.Ctx, t.CheckpointPath, runtime.NewStdio(t.Stdin, t.Stdout, t.Stderr))
 		if err != nil {
 			logrus.WithFields(logrus.Fields{
 				"error": err,
@@ -48,14 +53,44 @@ func (w *worker) Start() {
 			evt := &DeleteTask{
 				ID:      t.Container.ID(),
 				NoEvent: true,
+				Process: process,
 			}
 			w.s.SendTask(evt)
 			continue
 		}
+		if err := w.s.monitor.MonitorOOM(t.Container); err != nil && err != runtime.ErrContainerExited && err != runtime.ErrOOMNotSupported {
+			if process.State() != runtime.Stopped {
+				logrus.WithField("error", err).Error("containerd: notify OOM events")
+			}
+		}
 		if err := w.s.monitorProcess(process); err != nil {
 			logrus.WithField("error", err).Error("containerd: add process to monitor")
+			t.Err <- err
+			evt := &DeleteTask{
+				ID:      t.Container.ID(),
+				NoEvent: true,
+				Process: process,
+			}
+			w.s.SendTask(evt)
+			continue
+		}
+		// only call process start if we aren't restoring from a checkpoint
+		// if we have restored from a checkpoint then the process is already started
+		if t.CheckpointPath == "" {
+			if err := process.Start(); err != nil {
+				logrus.WithField("error", err).Error("containerd: start init process")
+				t.Err <- err
+				evt := &DeleteTask{
+					ID:      t.Container.ID(),
+					NoEvent: true,
+					Process: process,
+				}
+				w.s.SendTask(evt)
+				continue
+			}
 		}
 		ContainerStartTimer.UpdateSince(started)
+		w.s.newExecSyncMap(t.Container.ID())
 		t.Err <- nil
 		t.StartResponse <- StartResponse{
 			Container: t.Container,

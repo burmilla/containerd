@@ -7,15 +7,15 @@ import (
 
 	netcontext "golang.org/x/net/context"
 
-	"github.com/codegangsta/cli"
-	"github.com/docker/containerd"
-	"github.com/docker/containerd/api/grpc/types"
-	"github.com/sirupsen/logrus"
+	"github.com/Sirupsen/logrus"
+	"github.com/urfave/cli"
+	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/api/grpc/types"
 )
 
 const usage = `High performance container daemon cli`
 
-type Exit struct {
+type exit struct {
 	Code int
 }
 
@@ -23,7 +23,7 @@ func main() {
 	// We want our defer functions to be run when calling fatal()
 	defer func() {
 		if e := recover(); e != nil {
-			if ex, ok := e.(Exit); ok == true {
+			if ex, ok := e.(exit); ok == true {
 				os.Exit(ex.Code)
 			}
 			panic(e)
@@ -86,5 +86,5 @@ var versionCommand = cli.Command{
 
 func fatal(err string, code int) {
 	fmt.Fprintf(os.Stderr, "[ctr] %s\n", err)
-	panic(Exit{code})
+	panic(exit{code})
 }

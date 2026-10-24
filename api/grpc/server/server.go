@@ -13,10 +13,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 
-	"github.com/docker/containerd"
-	"github.com/docker/containerd/api/grpc/types"
-	"github.com/docker/containerd/runtime"
-	"github.com/docker/containerd/supervisor"
+	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/api/grpc/types"
+	"github.com/containerd/containerd/runtime"
+	"github.com/containerd/containerd/supervisor"
+	"github.com/golang/protobuf/ptypes"
 	"golang.org/x/net/context"
 )
 
@@ -55,6 +56,7 @@ func (s *apiServer) CreateContainer(ctx context.Context, c *types.CreateContaine
 	e.Runtime = c.Runtime
 	e.RuntimeArgs = c.RuntimeArgs
 	e.StartResponse = make(chan supervisor.StartResponse, 1)
+	e.Ctx = ctx
 	if c.Checkpoint != "" {
 		e.CheckpointDir = c.CheckpointDir
 		e.Checkpoint = &runtime.Checkpoint{
@@ -82,9 +84,10 @@ func (s *apiServer) CreateCheckpoint(ctx context.Context, r *types.CreateCheckpo
 	e.Checkpoint = &runtime.Checkpoint{
 		Name:        r.Checkpoint.Name,
 		Exit:        r.Checkpoint.Exit,
-		Tcp:         r.Checkpoint.Tcp,
+		TCP:         r.Checkpoint.Tcp,
 		UnixSockets: r.Checkpoint.UnixSockets,
 		Shell:       r.Checkpoint.Shell,
+		EmptyNS:     r.Checkpoint.EmptyNS,
 	}
 
 	s.sv.SendTask(e)
@@ -135,7 +138,7 @@ func (s *apiServer) ListCheckpoint(ctx context.Context, r *types.ListCheckpointR
 	for _, c := range checkpoints {
 		out = append(out, &types.Checkpoint{
 			Name:        c.Name,
-			Tcp:         c.Tcp,
+			Tcp:         c.TCP,
 			Shell:       c.Shell,
 			UnixSockets: c.UnixSockets,
 			// TODO: figure out timestamp
@@ -158,8 +161,14 @@ func (s *apiServer) Signal(ctx context.Context, r *types.SignalRequest) (*types.
 }
 
 func (s *apiServer) State(ctx context.Context, r *types.StateRequest) (*types.StateResponse, error) {
+
+	getState := func(c runtime.Container) (interface{}, error) {
+		return createAPIContainer(c, true)
+	}
+
 	e := &supervisor.GetContainersTask{}
 	e.ID = r.Id
+	e.GetState = getState
 	s.sv.SendTask(e)
 	if err := <-e.ErrorCh(); err != nil {
 		return nil, err
@@ -171,12 +180,8 @@ func (s *apiServer) State(ctx context.Context, r *types.StateRequest) (*types.St
 			Memory: uint64(m.Memory),
 		},
 	}
-	for _, c := range e.Containers {
-		apiC, err := createAPIContainer(c, true)
-		if err != nil {
-			return nil, err
-		}
-		state.Containers = append(state.Containers, apiC)
+	for idx := range e.Containers {
+		state.Containers = append(state.Containers, e.States[idx].(*types.Container))
 	}
 	return state, nil
 }
@@ -206,7 +211,8 @@ func createAPIContainer(c runtime.Container, getPids bool) (*types.Container, er
 			Gid:            oldProc.User.GID,
 			AdditionalGids: oldProc.User.AdditionalGids,
 		}
-		proc.Capabilities = oldProc.Capabilities
+		// FIXME: trying to mimic api compat with only using one field
+		proc.Capabilities = oldProc.Capabilities.Effective
 		proc.ApparmorProfile = oldProc.ApparmorProfile
 		proc.SelinuxLabel = oldProc.SelinuxLabel
 		proc.NoNewPrivileges = oldProc.NoNewPrivileges
@@ -273,6 +279,9 @@ func (s *apiServer) UpdateContainer(ctx context.Context, r *types.UpdateContaine
 		if rs.KernelMemoryLimit != 0 {
 			e.Resources.KernelMemory = int64(rs.KernelMemoryLimit)
 		}
+		if rs.KernelTCPMemoryLimit != 0 {
+			e.Resources.KernelTCPMemory = int64(rs.KernelTCPMemoryLimit)
+		}
 		if rs.MemoryLimit != 0 {
 			e.Resources.Memory = int64(rs.MemoryLimit)
 		}
@@ -281,6 +290,9 @@ func (s *apiServer) UpdateContainer(ctx context.Context, r *types.UpdateContaine
 		}
 		if rs.MemorySwap != 0 {
 			e.Resources.MemorySwap = int64(rs.MemorySwap)
+		}
+		if rs.PidsLimit != 0 {
+			e.Resources.PidsLimit = int64(rs.PidsLimit)
 		}
 	}
 	s.sv.SendTask(e)
@@ -306,28 +318,102 @@ func (s *apiServer) UpdateProcess(ctx context.Context, r *types.UpdateProcessReq
 
 func (s *apiServer) Events(r *types.EventsRequest, stream types.API_EventsServer) error {
 	t := time.Time{}
-	if r.Timestamp != 0 {
-		t = time.Unix(int64(r.Timestamp), 0)
+	if r.Timestamp != nil {
+		from, err := ptypes.Timestamp(r.Timestamp)
+		if err != nil {
+			return err
+		}
+		t = from
 	}
-	events := s.sv.Events(t)
+	if r.StoredOnly && t.IsZero() {
+		return fmt.Errorf("invalid parameter: StoredOnly cannot be specified without setting a valid Timestamp")
+	}
+	events := s.sv.Events(t, r.StoredOnly, r.Id)
 	defer s.sv.Unsubscribe(events)
 	for e := range events {
-		if err := stream.Send(&types.Event{
-			Id:        e.ID,
-			Type:      e.Type,
-			Timestamp: uint64(e.Timestamp.Unix()),
-			Pid:       e.PID,
-			Status:    uint32(e.Status),
-		}); err != nil {
+		tsp, err := ptypes.TimestampProto(e.Timestamp)
+		if err != nil {
 			return err
+		}
+		if r.Id == "" || e.ID == r.Id {
+			if err := stream.Send(&types.Event{
+				Id:        e.ID,
+				Type:      e.Type,
+				Timestamp: tsp,
+				Pid:       e.PID,
+				Status:    uint32(e.Status),
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
 func convertToPb(st *runtime.Stat) *types.StatsResponse {
+	tsp, _ := ptypes.TimestampProto(st.Timestamp)
 	pbSt := &types.StatsResponse{
-		Timestamp: uint64(st.Timestamp.Unix()),
+		Timestamp:   tsp,
+		CgroupStats: &types.CgroupStats{},
+	}
+	systemUsage, _ := getSystemCPUUsage()
+	pbSt.CgroupStats.CpuStats = &types.CpuStats{
+		CpuUsage: &types.CpuUsage{
+			TotalUsage:        st.CPU.Usage.Total,
+			PercpuUsage:       st.CPU.Usage.Percpu,
+			UsageInKernelmode: st.CPU.Usage.Kernel,
+			UsageInUsermode:   st.CPU.Usage.User,
+		},
+		ThrottlingData: &types.ThrottlingData{
+			Periods:          st.CPU.Throttling.Periods,
+			ThrottledPeriods: st.CPU.Throttling.ThrottledPeriods,
+			ThrottledTime:    st.CPU.Throttling.ThrottledTime,
+		},
+		SystemUsage: systemUsage,
+	}
+	pbSt.CgroupStats.MemoryStats = &types.MemoryStats{
+		Cache: st.Memory.Cache,
+		Usage: &types.MemoryData{
+			Usage:    st.Memory.Usage.Usage,
+			MaxUsage: st.Memory.Usage.Max,
+			Failcnt:  st.Memory.Usage.Failcnt,
+			Limit:    st.Memory.Usage.Limit,
+		},
+		SwapUsage: &types.MemoryData{
+			Usage:    st.Memory.Swap.Usage,
+			MaxUsage: st.Memory.Swap.Max,
+			Failcnt:  st.Memory.Swap.Failcnt,
+			Limit:    st.Memory.Swap.Limit,
+		},
+		KernelUsage: &types.MemoryData{
+			Usage:    st.Memory.Kernel.Usage,
+			MaxUsage: st.Memory.Kernel.Max,
+			Failcnt:  st.Memory.Kernel.Failcnt,
+			Limit:    st.Memory.Kernel.Limit,
+		},
+		Stats: st.Memory.Raw,
+	}
+	pbSt.CgroupStats.BlkioStats = &types.BlkioStats{
+		IoServiceBytesRecursive: convertBlkioEntryToPb(st.Blkio.IoServiceBytesRecursive),
+		IoServicedRecursive:     convertBlkioEntryToPb(st.Blkio.IoServicedRecursive),
+		IoQueuedRecursive:       convertBlkioEntryToPb(st.Blkio.IoQueuedRecursive),
+		IoServiceTimeRecursive:  convertBlkioEntryToPb(st.Blkio.IoServiceTimeRecursive),
+		IoWaitTimeRecursive:     convertBlkioEntryToPb(st.Blkio.IoWaitTimeRecursive),
+		IoMergedRecursive:       convertBlkioEntryToPb(st.Blkio.IoMergedRecursive),
+		IoTimeRecursive:         convertBlkioEntryToPb(st.Blkio.IoTimeRecursive),
+		SectorsRecursive:        convertBlkioEntryToPb(st.Blkio.SectorsRecursive),
+	}
+	pbSt.CgroupStats.HugetlbStats = make(map[string]*types.HugetlbStats)
+	for k, st := range st.Hugetlb {
+		pbSt.CgroupStats.HugetlbStats[k] = &types.HugetlbStats{
+			Usage:    st.Usage,
+			MaxUsage: st.Max,
+			Failcnt:  st.Failcnt,
+		}
+	}
+	pbSt.CgroupStats.PidsStats = &types.PidsStats{
+		Current: st.Pids.Current,
+		Limit:   st.Pids.Limit,
 	}
 	return pbSt
 }

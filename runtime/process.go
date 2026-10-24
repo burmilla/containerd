@@ -6,16 +6,21 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/docker/containerd/specs"
-	"github.com/docker/containerd/subreaper/exec"
+	"github.com/Sirupsen/logrus"
+	"github.com/containerd/containerd/osutils"
+	"github.com/containerd/containerd/specs"
 	"golang.org/x/sys/unix"
 )
 
+// Process holds the operation allowed on a container's process
 type Process interface {
 	io.Closer
 
@@ -23,13 +28,16 @@ type Process interface {
 	// This is either "init" when it is the container's init process or
 	// it is a user provided id for the process similar to the container id
 	ID() string
+	// Start unblocks the associated container init process.
+	// This should only be called on the process with ID "init"
+	Start() error
 	CloseStdin() error
 	Resize(int, int) error
 	// ExitFD returns the fd the provides an event when the process exits
 	ExitFD() int
 	// ExitStatus returns the exit status of the process or an error if it
 	// has not exited
-	ExitStatus() (int, error)
+	ExitStatus() (uint32, error)
 	// Spec returns the process spec that created the process
 	Spec() specs.ProcessSpec
 	// Signal sends the provided signal to the process
@@ -42,8 +50,8 @@ type Process interface {
 	SystemPid() int
 	// State returns if the process is running or not
 	State() State
-	// Start executes the process
-	Start() error
+	// Wait reaps the shim process if avaliable
+	Wait()
 }
 
 type processConfig struct {
@@ -64,6 +72,8 @@ func newProcess(config *processConfig) (*process, error) {
 		container: config.c,
 		spec:      config.processSpec,
 		stdio:     config.stdio,
+		cmdDoneCh: make(chan struct{}),
+		state:     Running,
 	}
 	uid, gid, err := getRootIDs(config.spec)
 	if err != nil {
@@ -106,18 +116,6 @@ func newProcess(config *processConfig) (*process, error) {
 	return p, nil
 }
 
-func (p *process) Start() error {
-	cmd := exec.Command(p.container.shim,
-		p.container.id, p.container.bundle, p.container.runtime,
-	)
-	cmd.Dir = p.root
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
-
-	return p.startCmd(cmd)
-}
-
 func loadProcess(root, id string, c *container, s *ProcessState) (*process, error) {
 	p := &process{
 		root:      root,
@@ -129,7 +127,15 @@ func loadProcess(root, id string, c *container, s *ProcessState) (*process, erro
 			Stdout: s.Stdout,
 			Stderr: s.Stderr,
 		},
+		state: Stopped,
 	}
+
+	startTime, err := ioutil.ReadFile(filepath.Join(p.root, StartTimeFile))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	p.startTime = string(startTime)
+
 	if _, err := p.getPidFromFile(); err != nil {
 		return nil, err
 	}
@@ -140,11 +146,43 @@ func loadProcess(root, id string, c *container, s *ProcessState) (*process, erro
 				return nil, err
 			}
 			p.exitPipe = exit
+
+			control, err := getControlPipe(filepath.Join(root, ControlFile))
+			if err != nil {
+				return nil, err
+			}
+			p.controlPipe = control
+
+			p.state = Running
 			return p, nil
 		}
 		return nil, err
 	}
 	return p, nil
+}
+
+func readProcStatField(pid int, field int) (string, error) {
+	data, err := ioutil.ReadFile(filepath.Join(string(filepath.Separator), "proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return "", err
+	}
+
+	if field > 2 {
+		// First, split out the name since he could contains spaces.
+		parts := strings.Split(string(data), ") ")
+		// Now split out the rest, we end up with 2 fields less
+		parts = strings.Split(parts[1], " ")
+		return parts[field-2-1], nil // field count start at 1 in manual
+	}
+
+	parts := strings.Split(string(data), " (")
+
+	if field == 1 {
+		return parts[0], nil
+	}
+
+	parts = strings.Split(parts[1], ") ")
+	return parts[0], nil
 }
 
 type process struct {
@@ -156,6 +194,12 @@ type process struct {
 	container   *container
 	spec        specs.ProcessSpec
 	stdio       Stdio
+	cmd         *exec.Cmd
+	cmdSuccess  bool
+	cmdDoneCh   chan struct{}
+	state       State
+	stateLock   sync.Mutex
+	startTime   string
 }
 
 func (p *process) ID() string {
@@ -185,18 +229,106 @@ func (p *process) Resize(w, h int) error {
 	return err
 }
 
-func (p *process) ExitStatus() (int, error) {
+func (p *process) updateExitStatusFile(status uint32) (uint32, error) {
+	p.stateLock.Lock()
+	p.state = Stopped
+	p.stateLock.Unlock()
+	err := ioutil.WriteFile(filepath.Join(p.root, ExitStatusFile), []byte(fmt.Sprintf("%d", status)), 0644)
+	return status, err
+}
+
+func (p *process) handleSigkilledShim(rst uint32, rerr error) (uint32, error) {
+	if p.cmd == nil || p.cmd.Process == nil {
+		e := unix.Kill(p.pid, 0)
+		if e == syscall.ESRCH {
+			logrus.Warnf("containerd: %s:%s (pid %d) does not exist", p.container.id, p.id, p.pid)
+			// The process died while containerd was down (probably of
+			// SIGKILL, but no way to be sure)
+			return p.updateExitStatusFile(UnknownStatus)
+		}
+
+		// If it's not the same process, just mark it stopped and set
+		// the status to the UnknownStatus value (i.e. 255)
+		if same, err := p.isSameProcess(); !same {
+			logrus.Warnf("containerd: %s:%s (pid %d) is not the same process anymore (%v)", p.container.id, p.id, p.pid, err)
+			// Create the file so we get the exit event generated once monitor kicks in
+			// without having to go through all this process again
+			return p.updateExitStatusFile(UnknownStatus)
+		}
+
+		ppid, err := readProcStatField(p.pid, 4)
+		if err != nil {
+			return rst, fmt.Errorf("could not check process ppid: %v (%v)", err, rerr)
+		}
+		if ppid == "1" {
+			logrus.Warnf("containerd: %s:%s shim died, killing associated process", p.container.id, p.id)
+			unix.Kill(p.pid, syscall.SIGKILL)
+			if err != nil && err != syscall.ESRCH {
+				return UnknownStatus, fmt.Errorf("containerd: unable to SIGKILL %s:%s (pid %v): %v", p.container.id, p.id, p.pid, err)
+			}
+
+			// wait for the process to die
+			for {
+				e := unix.Kill(p.pid, 0)
+				if e == syscall.ESRCH {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			// Create the file so we get the exit event generated once monitor kicks in
+			// without having to go through all this process again
+			return p.updateExitStatusFile(128 + uint32(syscall.SIGKILL))
+		}
+
+		return rst, rerr
+	}
+
+	// Possible that the shim was SIGKILLED
+	e := unix.Kill(p.cmd.Process.Pid, 0)
+	if e != syscall.ESRCH {
+		return rst, rerr
+	}
+
+	// Ensure we got the shim ProcessState
+	<-p.cmdDoneCh
+
+	shimStatus := p.cmd.ProcessState.Sys().(syscall.WaitStatus)
+	if shimStatus.Signaled() && shimStatus.Signal() == syscall.SIGKILL {
+		logrus.Debugf("containerd: ExitStatus(container: %s, process: %s): shim was SIGKILL'ed reaping its child with pid %d", p.container.id, p.id, p.pid)
+
+		rerr = nil
+		rst = 128 + uint32(shimStatus.Signal())
+
+		p.stateLock.Lock()
+		p.state = Stopped
+		p.stateLock.Unlock()
+	}
+
+	return rst, rerr
+}
+
+func (p *process) ExitStatus() (rst uint32, rerr error) {
 	data, err := ioutil.ReadFile(filepath.Join(p.root, ExitStatusFile))
+	defer func() {
+		if rerr != nil {
+			rst, rerr = p.handleSigkilledShim(rst, rerr)
+		}
+	}()
 	if err != nil {
 		if os.IsNotExist(err) {
-			return -1, ErrProcessNotExited
+			return UnknownStatus, ErrProcessNotExited
 		}
-		return -1, err
+		return UnknownStatus, err
 	}
 	if len(data) == 0 {
-		return -1, ErrProcessNotExited
+		return UnknownStatus, ErrProcessNotExited
 	}
-	return strconv.Atoi(string(data))
+	p.stateLock.Lock()
+	p.state = Stopped
+	p.stateLock.Unlock()
+
+	i, err := strconv.ParseUint(string(data), 10, 32)
+	return uint32(i), err
 }
 
 func (p *process) Spec() specs.ProcessSpec {
@@ -209,31 +341,64 @@ func (p *process) Stdio() Stdio {
 
 // Close closes any open files and/or resouces on the process
 func (p *process) Close() error {
-	return p.exitPipe.Close()
+	err := p.exitPipe.Close()
+	if cerr := p.controlPipe.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 func (p *process) State() State {
-	if p.pid == 0 {
-		return Stopped
-	}
-	err := syscall.Kill(p.pid, 0)
-	if err != nil && err == syscall.ESRCH {
-		return Stopped
-	}
-	return Running
+	p.stateLock.Lock()
+	defer p.stateLock.Unlock()
+	return p.state
 }
 
-func (p *process) getPidFromFile() (int, error) {
-	data, err := ioutil.ReadFile(filepath.Join(p.root, "pid"))
+func (p *process) readStartTime() (string, error) {
+	return readProcStatField(p.pid, 22)
+}
+
+func (p *process) saveStartTime() error {
+	startTime, err := p.readStartTime()
 	if err != nil {
-		return -1, err
+		return err
 	}
-	i, err := strconv.Atoi(string(data))
+
+	p.startTime = startTime
+	return ioutil.WriteFile(filepath.Join(p.root, StartTimeFile), []byte(startTime), 0644)
+}
+
+func (p *process) isSameProcess() (bool, error) {
+	if p.pid == 0 {
+		_, err := p.getPidFromFile()
+		if err != nil {
+			return false, err
+		}
+	}
+
+	// for backward compat assume it's the same if startTime wasn't set
+	if p.startTime == "" {
+		// Sometimes the process dies before we can get the starttime,
+		// check that the process actually exists
+		if err := unix.Kill(p.pid, 0); err != syscall.ESRCH {
+			return true, nil
+		}
+		return false, nil
+	}
+
+	startTime, err := p.readStartTime()
 	if err != nil {
-		return -1, errInvalidPidInt
+		return false, err
 	}
-	p.pid = i
-	return i, nil
+
+	return startTime == p.startTime, nil
+}
+
+// Wait will reap the shim process
+func (p *process) Wait() {
+	if p.cmdDoneCh != nil {
+		<-p.cmdDoneCh
+	}
 }
 
 func getExitPipe(path string) (*os.File, error) {
@@ -257,84 +422,55 @@ func (p *process) Signal(s os.Signal) error {
 	return syscall.Kill(p.pid, s.(syscall.Signal))
 }
 
-func (p *process) startCmd(cmd *exec.Cmd) error {
-	if err := cmd.Start(); err != nil {
-		if exErr, ok := err.(*exec.Error); ok {
-			if exErr.Err == exec.ErrNotFound || exErr.Err == os.ErrNotExist {
-				return fmt.Errorf("%s not installed on system", p.container.shim)
+// Start unblocks the associated container init process.
+// This should only be called on the process with ID "init"
+func (p *process) Start() error {
+	if p.ID() == InitProcessID {
+		var (
+			errC = make(chan error, 1)
+			args = append(p.container.runtimeArgs, "start", p.container.id)
+			cmd  = exec.Command(p.container.runtime, args...)
+		)
+		go func() {
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				errC <- fmt.Errorf("%s: %q", err.Error(), out)
+			}
+			errC <- nil
+		}()
+		select {
+		case err := <-errC:
+			if err != nil {
+				return err
+			}
+		case <-p.cmdDoneCh:
+			if !p.cmdSuccess {
+				if cmd.Process != nil {
+					cmd.Process.Kill()
+				}
+				cmd.Wait()
+				return ErrShimExited
+			}
+			err := <-errC
+			if err != nil {
+				return err
 			}
 		}
-		return err
-	}
-	if err := p.waitForStart(cmd); err != nil {
-		return err
 	}
 	return nil
 }
 
-func (p *process) waitForStart(cmd *exec.Cmd) error {
-	wc := make(chan error, 1)
-	go func() {
-		for {
-			if _, err := p.getPidFromFile(); err != nil {
-				if os.IsNotExist(err) || err == errInvalidPidInt {
-					alive, err := isAlive(cmd)
-					if err != nil {
-						wc <- err
-						return
-					}
-					if !alive {
-						// runc could have failed to run the container so lets get the error
-						// out of the logs or the shim could have encountered an error
-						messages, err := readLogMessages(filepath.Join(p.root, "shim-log.json"))
-						if err != nil && !os.IsNotExist(err) {
-							wc <- err
-							return
-						}
-						for _, m := range messages {
-							if m.Level == "error" {
-								wc <- fmt.Errorf("shim error: %v", m.Msg)
-								return
-							}
-						}
-						// no errors reported back from shim, check for runc/runtime errors
-						messages, err = readLogMessages(filepath.Join(p.root, "log.json"))
-						if err != nil {
-							if os.IsNotExist(err) {
-								err = ErrContainerNotStarted
-							}
-							wc <- err
-							return
-						}
-						for _, m := range messages {
-							if m.Level == "error" {
-								wc <- fmt.Errorf("oci runtime error: %v", m.Msg)
-								return
-							}
-						}
-						wc <- ErrContainerNotStarted
-						return
-					}
-					time.Sleep(15 * time.Millisecond)
-					continue
-				}
-				wc <- err
-				return
-			}
-			// the pid file was read successfully
-			wc <- nil
-			return
-		}
-	}()
-	select {
-	case err := <-wc:
-		if err != nil {
-			return err
-		}
-		return nil
-	case <-time.After(p.container.timeout):
-		cmd.Process.Kill()
-		cmd.Wait()
-		return ErrContainerStartTimeout
+// Delete delete any resources held by the container
+func (p *process) Delete() error {
+	var (
+		args = append(p.container.runtimeArgs, "delete", "-f", p.container.id)
+		cmd  = exec.Command(p.container.runtime, args...)
+	)
+
+	cmd.SysProcAttr = osutils.SetPDeathSig()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: %v", out, err)
 	}
+	return nil
 }

@@ -6,21 +6,31 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 
-	"github.com/docker/containerd/osutils"
-	"github.com/docker/docker/pkg/term"
+	"github.com/containerd/containerd/osutils"
+	"github.com/containerd/console"
 )
 
 func writeMessage(f *os.File, level string, err error) {
 	fmt.Fprintf(f, `{"level": "%s","msg": "%s"}`, level, err)
 }
 
+type controlMessage struct {
+	Type   int
+	Width  int
+	Height int
+}
+
 // containerd-shim is a small shim that sits in front of a runtime implementation
 // that allows it to be repartented to init and handle reattach from the caller.
 //
-// the cwd of the shim should be the bundle for the container.  Arg1 should be the path
-// to the state directory where the shim can locate fifos and other information.
+// the cwd of the shim should be the path to the state directory where the shim
+// can locate fifos and other information.
+// Arg0: id of the container
+// Arg1: bundle path
+// Arg2: runtime binary
 func main() {
 	flag.Parse()
 	cwd, err := os.Getwd()
@@ -72,22 +82,64 @@ func start(log *os.File) error {
 	if err != nil {
 		return err
 	}
+	if err := p.openIO(); err != nil {
+		return err
+	}
 	defer func() {
 		if err := p.Close(); err != nil {
 			writeMessage(log, "warn", err)
 		}
 	}()
-	if err := p.start(); err != nil {
+	if err := p.create(); err != nil {
 		p.delete()
 		return err
 	}
+	if err := <-p.consoleErrCh; err != nil {
+		p.delete()
+		return err
+	}
+	msgC := make(chan controlMessage, 32)
 	go func() {
 		for {
-			var msg, w, h int
-			if _, err := fmt.Fscanf(control, "%d %d %d\n", &msg, &w, &h); err != nil {
+			var m controlMessage
+			if _, err := fmt.Fscanf(control, "%d %d %d\n", &m.Type, &m.Width, &m.Height); err != nil {
 				continue
 			}
-			switch msg {
+			msgC <- m
+		}
+	}()
+	if runtime.GOOS == "solaris" {
+		return nil
+	}
+	var exitShim bool
+	for {
+		select {
+		case s := <-signals:
+			switch s {
+			case syscall.SIGCHLD:
+				exits, _ := osutils.Reap(false)
+				for _, e := range exits {
+					// check to see if runtime is one of the processes that has exited
+					if e.Pid == p.pid() {
+						exitShim = true
+						writeInt("exitStatus", e.Status)
+					}
+				}
+			}
+			// runtime has exited so the shim can also exit
+			if exitShim {
+				// kill all processes in the container incase it was not running in
+				// its own PID namespace
+				p.killAll()
+				// wait for all the processes and IO to finish
+				p.Wait()
+				// delete the container from the runtime
+				p.delete()
+				// the close of the exit fifo will happen when the shim exits
+				return nil
+			}
+		case msg := <-msgC:
+			switch msg.Type {
 			case 0:
 				// close stdin
 				if p.stdinCloser != nil {
@@ -97,35 +149,13 @@ func start(log *os.File) error {
 				if p.console == nil {
 					continue
 				}
-				ws := term.Winsize{
-					Width:  uint16(w),
-					Height: uint16(h),
-				}
-				term.SetWinsize(p.console.Fd(), &ws)
+				p.console.Resize(console.WinSize{
+					Width:  uint16(msg.Width),
+					Height: uint16(msg.Height),
+				})
 			}
-		}
-	}()
-	var exitShim bool
-	for s := range signals {
-		switch s {
-		case syscall.SIGCHLD:
-			exits, _ := osutils.Reap()
-			for _, e := range exits {
-				// check to see if runtime is one of the processes that has exited
-				if e.Pid == p.pid() {
-					exitShim = true
-					writeInt("exitStatus", e.Status)
-				}
-			}
-		}
-		// runtime has exited so the shim can also exit
-		if exitShim {
-			p.delete()
-			p.Wait()
-			return nil
 		}
 	}
-	return nil
 }
 
 func writeInt(path string, i int) error {

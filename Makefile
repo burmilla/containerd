@@ -1,14 +1,16 @@
 BUILDTAGS=
 
-PROJECT=github.com/docker/containerd
+PROJECT=github.com/containerd/containerd
 
 GIT_COMMIT := $(shell git rev-parse HEAD 2> /dev/null || true)
 GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2> /dev/null)
 
-LDFLAGS := -X github.com/docker/containerd.GitCommit=${GIT_COMMIT} ${LDFLAGS}
+LDFLAGS := -X github.com/containerd/containerd.GitCommit=${GIT_COMMIT} ${LDFLAGS}
 
 TEST_TIMEOUT ?= 5m
 TEST_SUITE_TIMEOUT ?= 10m
+
+RUNTIME ?= runc
 
 # if this session isn't interactive, then we don't want to allocate a
 # TTY, which would fail, but if it is interactive, we do want to attach
@@ -26,6 +28,8 @@ DOCKER_RUN := docker run --privileged --rm -i $(DOCKER_FLAGS) "$(DOCKER_IMAGE)"
 
 
 export GOPATH:=$(CURDIR)/vendor:$(GOPATH)
+
+.PHONY: integration-test
 
 all: client daemon shim
 
@@ -50,7 +54,7 @@ daemon-static:
 	cd containerd && go build -ldflags "-w -extldflags -static ${LDFLAGS}" -tags "$(BUILDTAGS)" -o ../bin/containerd
 
 shim: bin
-	cd containerd-shim && go build -tags "$(BUILDTAGS)" -ldflags "-w" -o ../bin/containerd-shim
+	cd containerd-shim && go build -tags "$(BUILDTAGS)" -ldflags "-w ${LDFLAGS}" -o ../bin/containerd-shim
 
 shim-static:
 	cd containerd-shim && go build -ldflags "-w -extldflags -static ${LDFLAGS}" -tags "$(BUILDTAGS)" -o ../bin/containerd-shim
@@ -80,23 +84,26 @@ fmt:
 	@gofmt -s -l . | grep -v vendor | grep -v .pb. | tee /dev/stderr
 
 lint:
-	@golint ./... | grep -v vendor | grep -v .pb. | tee /dev/stderr
+	@hack/validate-lint
 
 shell: dbuild
 	$(DOCKER_RUN) bash
 
 test: validate install bundles-rootfs
-	go test -bench=. -v $(shell go list ./... | grep -v /vendor | grep -v /integration-test)
+	go test -bench=. -v $(shell go list ./... | grep -v /vendor | grep -v /integration-test ) -runtime=$(RUNTIME)
 ifneq ($(wildcard /.dockerenv), )
 	cd integration-test ; \
-	go test -check.v -check.timeout=$(TEST_TIMEOUT) -timeout=$(TEST_SUITE_TIMEOUT) $(TESTFLAGS) github.com/docker/containerd/integration-test && \
-	go test -containerd.shim="" -check.v -check.timeout=$(TEST_TIMEOUT) -timeout=$(TEST_SUITE_TIMEOUT) $(TESTFLAGS) github.com/docker/containerd/integration-test
+go test -check.v -check.timeout=$(TEST_TIMEOUT) $(TESTFLAGS) timeout=$(TEST_SUITE_TIMEOUT) github.com/containerd/containerd/integration-test
 endif
 
-bench: shim validate install bundles-rootfs
-	go test -bench=. -v $(shell go list ./... | grep -v /vendor | grep -v /integration-test)
+integration-test:
+	cd integration-test ; \
+go test -check.v -check.timeout=$(TEST_TIMEOUT) $(TESTFLAGS) timeout=$(TEST_SUITE_TIMEOUT) github.com/containerd/containerd/integration-test
 
-validate: fmt
+bench: shim validate install bundles-rootfs
+	go test -bench=. -v $(shell go list ./... | grep -v /vendor | grep -v /integration-test) -runtime=$(RUNTIME)
+
+validate: fmt lint
 
 uninstall:
 	$(foreach file,containerd containerd-shim ctr,rm /usr/local/bin/$(file);)

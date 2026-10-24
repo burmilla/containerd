@@ -3,10 +3,11 @@ package supervisor
 import (
 	"time"
 
-	"github.com/docker/containerd/runtime"
-	"github.com/sirupsen/logrus"
+	"github.com/Sirupsen/logrus"
+	"github.com/containerd/containerd/runtime"
 )
 
+// ExitTask holds needed parameters to execute the exit task
 type ExitTask struct {
 	baseTask
 	Process runtime.Process
@@ -40,27 +41,29 @@ func (s *Supervisor) exit(t *ExitTask) error {
 			Status:  status,
 			Process: proc,
 		}
-		s.SendTask(ne)
+		s.execExit(ne)
 		return nil
 	}
 	container := proc.Container()
 	ne := &DeleteTask{
-		ID:     container.ID(),
-		Status: status,
-		PID:    proc.ID(),
+		ID:      container.ID(),
+		Status:  status,
+		PID:     proc.ID(),
+		Process: proc,
 	}
-	s.SendTask(ne)
+	s.delete(ne)
 
 	ExitProcessTimer.UpdateSince(start)
 
 	return nil
 }
 
+// ExecExitTask holds needed parameters to execute the exec exit task
 type ExecExitTask struct {
 	baseTask
 	ID      string
 	PID     string
-	Status  int
+	Status  uint32
 	Process runtime.Process
 }
 
@@ -70,12 +73,21 @@ func (s *Supervisor) execExit(t *ExecExitTask) error {
 	if err := container.RemoveProcess(t.PID); err != nil {
 		logrus.WithField("error", err).Error("containerd: find container for pid")
 	}
-	s.notifySubscribers(Event{
-		Timestamp: time.Now(),
-		ID:        t.ID,
-		Type:      StateExit,
-		PID:       t.PID,
-		Status:    t.Status,
-	})
+	synCh := s.getExecSyncChannel(t.ID, t.PID)
+	// If the exec spawned children which are still using its IO
+	// waiting here will block until they die or close their IO
+	// descriptors.
+	// Hence, we use a go routine to avoid blocking all other operations
+	go func() {
+		t.Process.Wait()
+		s.notifySubscribers(Event{
+			Timestamp: time.Now(),
+			ID:        t.ID,
+			Type:      StateExit,
+			PID:       t.PID,
+			Status:    t.Status,
+		})
+		close(synCh)
+	}()
 	return nil
 }

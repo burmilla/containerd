@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -10,12 +12,13 @@ import (
 	"testing"
 	"time"
 
-	utils "github.com/docker/containerd/testutils"
+	utils "github.com/containerd/containerd/testutils"
 )
 
 var (
-	devNull = "/dev/null"
-	stdin   io.WriteCloser
+	devNull     = "/dev/null"
+	stdin       io.WriteCloser
+	runtimeTool = flag.String("runtime", "runc", "Runtime to use for this test")
 )
 
 // Create containerd state and oci bundles directory
@@ -62,13 +65,16 @@ func setupStdio(cwd string, bundlePath string, bundleName string) (Stdio, error)
 	s := NewStdio(devNull, devNull, devNull)
 
 	pid := "init"
-	for stdName, stdPath := range map[string]*string{
-		"stdin":  &s.Stdin,
-		"stdout": &s.Stdout,
-		"stderr": &s.Stderr,
+	for _, pair := range []struct {
+		stdName string
+		stdPath *string
+	}{
+		{"stdin", &s.Stdin},
+		{"stdout", &s.Stdout},
+		{"stderr", &s.Stderr},
 	} {
-		*stdPath = filepath.Join(cwd, bundlePath, "io", bundleName+"-"+pid+"-"+stdName)
-		if err := syscall.Mkfifo(*stdPath, 0755); err != nil && !os.IsExist(err) {
+		*pair.stdPath = filepath.Join(cwd, bundlePath, "io", bundleName+"-"+pid+"-"+pair.stdName)
+		if err := syscall.Mkfifo(*pair.stdPath, 0755); err != nil && !os.IsExist(err) {
 			fmt.Println("Mkfifo error: ", err)
 			return s, err
 		}
@@ -145,13 +151,13 @@ func BenchmarkBusyboxSh(b *testing.B) {
 			Root:    utils.StateDir,
 			ID:      bundleName,
 			Bundle:  filepath.Join(wd, bundlePath),
-			Runtime: "runc",
+			Runtime: *runtimeTool,
 			Shim:    "containerd-shim",
 			Timeout: 15 * time.Second,
 		})
 
 		if err != nil {
-			b.Fatalf("Error creating a New container: ", err)
+			b.Fatalf("Error creating a New container: %v", err)
 		}
 
 		benchmarkStartContainer(b, c, s, bundleName)
@@ -161,12 +167,16 @@ func BenchmarkBusyboxSh(b *testing.B) {
 }
 
 func benchmarkStartContainer(b *testing.B, c Container, s Stdio, bundleName string) {
-	if _, err := c.Start("", s); err != nil {
+	p, err := c.Start(context.Background(), "", s)
+	if err != nil {
 		b.Fatalf("Error starting container %v", err)
 	}
 
-	kill := exec.Command("runc", "kill", bundleName, "KILL")
+	kill := exec.Command(c.Runtime(), "kill", bundleName, "KILL")
 	kill.Run()
+
+	p.Wait()
+	c.Delete()
 
 	// wait for kill to finish. selected wait time is arbitrary
 	time.Sleep(500 * time.Millisecond)

@@ -9,12 +9,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/docker/containerd/specs"
+	"github.com/containerd/containerd/osutils"
+	"github.com/containerd/containerd/specs"
+	"github.com/containerd/console"
+	runc "github.com/containerd/go-runc"
 )
 
 var errRuntime = errors.New("shim: runtime execution error")
@@ -24,14 +28,16 @@ type checkpoint struct {
 	Created time.Time `json:"created"`
 	// Name is the name of the checkpoint
 	Name string `json:"name"`
-	// Tcp checkpoints open tcp connections
-	Tcp bool `json:"tcp"`
+	// TCP checkpoints open tcp connections
+	TCP bool `json:"tcp"`
 	// UnixSockets persists unix sockets in the checkpoint
 	UnixSockets bool `json:"unixSockets"`
 	// Shell persists tty sessions in the checkpoint
 	Shell bool `json:"shell"`
 	// Exit exits the container after the checkpoint is finished
 	Exit bool `json:"exit"`
+	// EmptyNS tells CRIU not to restore a particular namespace
+	EmptyNS []string `json:"emptyNS,omitempty"`
 }
 
 type processState struct {
@@ -52,23 +58,26 @@ type process struct {
 	id             string
 	bundle         string
 	stdio          *stdio
-	exec           bool
 	containerPid   int
 	checkpoint     *checkpoint
 	checkpointPath string
 	shimIO         *IO
 	stdinCloser    io.Closer
-	console        *os.File
-	consolePath    string
 	state          *processState
 	runtime        string
+	ioCleanupFn    func()
+
+	socket       *runc.Socket
+	console      console.Console
+	consoleErrCh chan error
 }
 
 func newProcess(id, bundle, runtimeName string) (*process, error) {
 	p := &process{
-		id:      id,
-		bundle:  bundle,
-		runtime: runtimeName,
+		id:           id,
+		bundle:       bundle,
+		runtime:      runtimeName,
+		consoleErrCh: make(chan error, 1),
 	}
 	s, err := loadProcess()
 	if err != nil {
@@ -82,9 +91,6 @@ func newProcess(id, bundle, runtimeName string) (*process, error) {
 		}
 		p.checkpoint = cpt
 		p.checkpointPath = s.CheckpointPath
-	}
-	if err := p.openIO(); err != nil {
-		return nil, err
 	}
 	return p, nil
 }
@@ -115,7 +121,7 @@ func loadCheckpoint(checkpointPath string) (*checkpoint, error) {
 	return &cpt, nil
 }
 
-func (p *process) start() error {
+func (p *process) create() error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -127,12 +133,18 @@ func (p *process) start() error {
 	}, p.state.RuntimeArgs...)
 	if p.state.Exec {
 		args = append(args, "exec",
+			"-d",
 			"--process", filepath.Join(cwd, "process.json"),
-			"--console", p.consolePath,
 		)
+		if p.socket != nil {
+			args = append(args, "--console-socket", p.socket.Path())
+		}
+
 	} else if p.checkpoint != nil {
 		args = append(args, "restore",
-			"--image-path", filepath.Join(p.checkpointPath),
+			"-d",
+			"--image-path", p.checkpointPath,
+			"--work-path", filepath.Join(p.checkpointPath, "criu.work", "restore-"+time.Now().Format(time.RFC3339Nano)),
 		)
 		add := func(flags ...string) {
 			args = append(args, flags...)
@@ -140,7 +152,7 @@ func (p *process) start() error {
 		if p.checkpoint.Shell {
 			add("--shell-job")
 		}
-		if p.checkpoint.Tcp {
+		if p.checkpoint.TCP {
 			add("--tcp-established")
 		}
 		if p.checkpoint.UnixSockets {
@@ -149,17 +161,22 @@ func (p *process) start() error {
 		if p.state.NoPivotRoot {
 			add("--no-pivot")
 		}
+		for _, ns := range p.checkpoint.EmptyNS {
+			add("--empty-ns", ns)
+		}
+
 	} else {
-		args = append(args, "start",
+		args = append(args, "create",
 			"--bundle", p.bundle,
-			"--console", p.consolePath,
 		)
+		if p.socket != nil {
+			args = append(args, "--console-socket", p.socket.Path())
+		}
 		if p.state.NoPivotRoot {
 			args = append(args, "--no-pivot")
 		}
 	}
 	args = append(args,
-		"-d",
 		"--pid-file", filepath.Join(cwd, "pid"),
 		p.id,
 	)
@@ -168,8 +185,8 @@ func (p *process) start() error {
 	cmd.Stdin = p.stdio.stdin
 	cmd.Stdout = p.stdio.stdout
 	cmd.Stderr = p.stdio.stderr
-	// Call out to setPDeathSig to set SysProcAttr as elements are platform specific
-	cmd.SysProcAttr = setPDeathSig()
+	// Call out to SetPDeathSig to set SysProcAttr as elements are platform specific
+	cmd.SysProcAttr = osutils.SetPDeathSig()
 
 	if err := cmd.Start(); err != nil {
 		if exErr, ok := err.(*exec.Error); ok {
@@ -179,8 +196,13 @@ func (p *process) start() error {
 		}
 		return err
 	}
-	p.stdio.stdout.Close()
-	p.stdio.stderr.Close()
+	if runtime.GOOS != "solaris" {
+		// Since current logic dictates that we need a pid at the end of p.create
+		// we need to call runtime start as well on Solaris hence we need the
+		// pipes to stay open.
+		p.stdio.stdout.Close()
+		p.stdio.stderr.Close()
+	}
 	if err := cmd.Wait(); err != nil {
 		if _, ok := err.(*exec.ExitError); ok {
 			return errRuntime
@@ -205,7 +227,9 @@ func (p *process) pid() int {
 
 func (p *process) delete() error {
 	if !p.state.Exec {
-		out, err := exec.Command(p.runtime, append(p.state.RuntimeArgs, "delete", p.id)...).CombinedOutput()
+		cmd := exec.Command(p.runtime, append(p.state.RuntimeArgs, "delete", p.id)...)
+		cmd.SysProcAttr = osutils.SetPDeathSig()
+		out, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("%s: %v", out, err)
 		}
@@ -213,92 +237,14 @@ func (p *process) delete() error {
 	return nil
 }
 
-// openIO opens the pre-created fifo's for use with the container
-// in RDWR so that they remain open if the other side stops listening
-func (p *process) openIO() error {
-	p.stdio = &stdio{}
-	var (
-		uid = p.state.RootUID
-		gid = p.state.RootGID
-	)
-	go func() {
-		if stdinCloser, err := os.OpenFile(p.state.Stdin, syscall.O_WRONLY, 0); err == nil {
-			p.stdinCloser = stdinCloser
-		}
-	}()
-
-	if p.state.Terminal {
-		master, console, err := newConsole(uid, gid)
-		if err != nil {
-			return err
-		}
-		p.console = master
-		p.consolePath = console
-		stdin, err := os.OpenFile(p.state.Stdin, syscall.O_RDONLY, 0)
-		if err != nil {
-			return err
-		}
-		go io.Copy(master, stdin)
-		stdout, err := os.OpenFile(p.state.Stdout, syscall.O_RDWR, 0)
-		if err != nil {
-			return err
-		}
-		p.Add(1)
-		go func() {
-			io.Copy(stdout, master)
-			master.Close()
-			p.Done()
-		}()
-		return nil
-	}
-	i, err := p.initializeIO(uid)
-	if err != nil {
-		return err
-	}
-	p.shimIO = i
-	// non-tty
-	for name, dest := range map[string]func(f *os.File){
-		p.state.Stdout: func(f *os.File) {
-			p.Add(1)
-			go func() {
-				io.Copy(f, i.Stdout)
-				p.Done()
-			}()
-		},
-		p.state.Stderr: func(f *os.File) {
-			p.Add(1)
-			go func() {
-				io.Copy(f, i.Stderr)
-				p.Done()
-			}()
-		},
-	} {
-		f, err := os.OpenFile(name, syscall.O_RDWR, 0)
-		if err != nil {
-			return err
-		}
-		dest(f)
-	}
-
-	f, err := os.OpenFile(p.state.Stdin, syscall.O_RDONLY, 0)
-	if err != nil {
-		return err
-	}
-	go func() {
-		io.Copy(i.Stdin, f)
-		i.Stdin.Close()
-	}()
-
-	return nil
-}
-
+// IO holds all 3 standard io Reader/Writer (stdin,stdout,stderr)
 type IO struct {
 	Stdin  io.WriteCloser
 	Stdout io.ReadCloser
 	Stderr io.ReadCloser
 }
 
-func (p *process) initializeIO(rootuid int) (i *IO, err error) {
+func (p *process) initializeIO(rootuid, rootgid int) (i *IO, err error) {
 	var fds []uintptr
 	i = &IO{}
 	// cleanup in case of an error
@@ -328,16 +274,20 @@ func (p *process) initializeIO(rootuid int) (i *IO, err error) {
 	}
 	fds = append(fds, r.Fd(), w.Fd())
 	p.stdio.stderr, i.Stderr = w, r
-	// change ownership of the pipes incase we are in a user namespace
+	// change ownership of the pipes in case we are in a user namespace
 	for _, fd := range fds {
-		if err := syscall.Fchown(int(fd), rootuid, rootuid); err != nil {
+		if err := syscall.Fchown(int(fd), rootuid, rootgid); err != nil {
 			return nil, err
 		}
 	}
 	return i, nil
 }
 func (p *process) Close() error {
-	return p.stdio.Close()
+	err := p.stdio.Close()
+	if p.socket != nil {
+		p.socket.Close()
+	}
+	return err
 }
 
 type stdio struct {

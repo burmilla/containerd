@@ -3,7 +3,7 @@ package supervisor
 import (
 	"sort"
 
-	"github.com/docker/containerd/runtime"
+	"github.com/containerd/containerd/runtime"
 )
 
 func sortProcesses(p []runtime.Process) {
@@ -23,5 +23,5 @@ func (s *processSorter) Swap(i, j int) {
 }
 
 func (s *processSorter) Less(i, j int) bool {
-	return s.processes[j].ID() == "init"
+	return s.processes[j].ID() == runtime.InitProcessID
 }

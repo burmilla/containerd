@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/containerd/runtime"
-	"github.com/sirupsen/logrus"
+	"github.com/Sirupsen/logrus"
+	"github.com/containerd/containerd/runtime"
 )
 
 const (
@@ -20,9 +20,6 @@ const (
 // New returns an initialized Process supervisor.
 func New(stateDir string, runtimeName, shimName string, runtimeArgs []string, timeout time.Duration, retainCount int) (*Supervisor, error) {
 	startTasks := make(chan *startTask, 10)
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
-		return nil, err
-	}
 	machine, err := CollectMachineInformation()
 	if err != nil {
 		return nil, err
@@ -32,17 +29,18 @@ func New(stateDir string, runtimeName, shimName string, runtimeArgs []string, ti
 		return nil, err
 	}
 	s := &Supervisor{
-		stateDir:    stateDir,
-		containers:  make(map[string]*containerInfo),
-		startTasks:  startTasks,
-		machine:     machine,
-		subscribers: make(map[chan Event]struct{}),
-		tasks:       make(chan Task, defaultBufferSize),
-		monitor:     monitor,
-		runtime:     runtimeName,
-		runtimeArgs: runtimeArgs,
-		shim:        shimName,
-		timeout:     timeout,
+		stateDir:          stateDir,
+		containers:        make(map[string]*containerInfo),
+		startTasks:        startTasks,
+		machine:           machine,
+		subscribers:       make(map[chan Event]struct{}),
+		tasks:             make(chan Task, defaultBufferSize),
+		monitor:           monitor,
+		runtime:           runtimeName,
+		runtimeArgs:       runtimeArgs,
+		shim:              shimName,
+		timeout:           timeout,
+		containerExecSync: make(map[string]map[string]chan struct{}),
 	}
 	if err := setupEventLog(s, retainCount); err != nil {
 		return nil, err
@@ -64,7 +62,7 @@ func setupEventLog(s *Supervisor, retainCount int) error {
 		return err
 	}
 	logrus.WithField("count", len(s.eventLog)).Debug("containerd: read past events")
-	events := s.Events(time.Time{})
+	events := s.Events(time.Time{}, false, "")
 	return eventLogger(s, filepath.Join(s.stateDir, "events.log"), events, retainCount)
 }
 
@@ -132,18 +130,26 @@ func readEventLog(s *Supervisor) error {
 	defer f.Close()
 	dec := json.NewDecoder(f)
 	for {
-		var e Event
+		var e eventV1
 		if err := dec.Decode(&e); err != nil {
 			if err == io.EOF {
 				break
 			}
 			return err
 		}
-		s.eventLog = append(s.eventLog, e)
+
+		// We need to take care of -1 Status for backward compatibility
+		ev := e.Event
+		ev.Status = uint32(e.Status)
+		if ev.Status > runtime.UnknownStatus {
+			ev.Status = runtime.UnknownStatus
+		}
+		s.eventLog = append(s.eventLog, ev)
 	}
 	return nil
 }
 
+// Supervisor represents a container supervisor
 type Supervisor struct {
 	// stateDir is the directory on the system to store container runtime state information.
 	stateDir string
@@ -163,6 +169,10 @@ type Supervisor struct {
 	eventLog       []Event
 	eventLock      sync.Mutex
 	timeout        time.Duration
+	// This is used to ensure that exec process death events are sent
+	// before the init process death
+	containerExecSyncLock sync.Mutex
+	containerExecSync     map[string]map[string]chan struct{}
 }
 
 // Stop closes all startTasks and sends a SIGTERM to each container's pid1 then waits for they to
@@ -179,22 +189,29 @@ func (s *Supervisor) Close() error {
 	return nil
 }
 
+// Event represents a container event
 type Event struct {
 	ID        string    `json:"id"`
 	Type      string    `json:"type"`
 	Timestamp time.Time `json:"timestamp"`
 	PID       string    `json:"pid,omitempty"`
-	Status    int       `json:"status,omitempty"`
+	Status    uint32    `json:"status,omitempty"`
+}
+
+type eventV1 struct {
+	Event
+	Status int `json:"status,omitempty"`
 }
 
 // Events returns an event channel that external consumers can use to receive updates
 // on container events
-func (s *Supervisor) Events(from time.Time) chan Event {
+func (s *Supervisor) Events(from time.Time, storedOnly bool, id string) chan Event {
+	c := make(chan Event, defaultBufferSize)
+	if storedOnly {
+		defer s.Unsubscribe(c)
+	}
 	s.subscriberLock.Lock()
 	defer s.subscriberLock.Unlock()
-	c := make(chan Event, defaultBufferSize)
-	EventSubscriberCounter.Inc(1)
-	s.subscribers[c] = struct{}{}
 	if !from.IsZero() {
 		// replay old event
 		s.eventLock.Lock()
@@ -202,14 +219,17 @@ func (s *Supervisor) Events(from time.Time) chan Event {
 		s.eventLock.Unlock()
 		for _, e := range past {
 			if e.Timestamp.After(from) {
-				c <- e
+				if id == "" || e.ID == id {
+					c <- e
+				}
 			}
 		}
-		// Notify the client that from now on it's live events
-		c <- Event{
-			Type:      StateLive,
-			Timestamp: time.Now(),
-		}
+	}
+	if storedOnly {
+		close(c)
+	} else {
+		EventSubscriberCounter.Inc(1)
+		s.subscribers[c] = struct{}{}
 	}
 	return c
 }
@@ -218,9 +238,11 @@ func (s *Supervisor) Events(from time.Time) chan Event {
 func (s *Supervisor) Unsubscribe(sub chan Event) {
 	s.subscriberLock.Lock()
 	defer s.subscriberLock.Unlock()
-	delete(s.subscribers, sub)
-	close(sub)
-	EventSubscriberCounter.Dec(1)
+	if _, ok := s.subscribers[sub]; ok {
+		delete(s.subscribers, sub)
+		close(sub)
+		EventSubscriberCounter.Dec(1)
+	}
 }
 
 // notifySubscribers will send the provided event to the external subscribers
@@ -304,19 +326,29 @@ func (s *Supervisor) restore() error {
 			continue
 		}
 		id := d.Name()
-		container, err := runtime.Load(s.stateDir, id, s.timeout)
+		container, err := runtime.Load(s.stateDir, id, s.shim, s.timeout)
 		if err != nil {
-			return err
+			logrus.WithFields(logrus.Fields{"error": err, "id": id}).Warnf("containerd: failed to load container,removing state directory.")
+			os.RemoveAll(filepath.Join(s.stateDir, id))
+			continue
 		}
 		processes, err := container.Processes()
-		if err != nil {
-			return err
+		if err != nil || len(processes) == 0 {
+			logrus.WithFields(logrus.Fields{"error": err, "id": id}).Warnf("containerd: container has no process running,removing state directory.")
+			os.RemoveAll(filepath.Join(s.stateDir, id))
+			continue
 		}
 
 		ContainersCounter.Inc(1)
 		s.containers[id] = &containerInfo{
 			container: container,
 		}
+		if err := s.monitor.MonitorOOM(container); err != nil && err != runtime.ErrContainerExited && err != runtime.ErrOOMNotSupported {
+			logrus.WithField("error", err).Error("containerd: notify OOM events")
+		}
+
+		s.newExecSyncMap(container.ID())
+
 		logrus.WithField("id", id).Debug("containerd: container restored")
 		var exitedProcesses []runtime.Process
 		for _, p := range processes {
@@ -326,6 +358,9 @@ func (s *Supervisor) restore() error {
 				}
 			} else {
 				exitedProcesses = append(exitedProcesses, p)
+			}
+			if p.ID() != runtime.InitProcessID {
+				s.newExecSyncChannel(container.ID(), p.ID())
 			}
 		}
 		if len(exitedProcesses) > 0 {
@@ -358,8 +393,6 @@ func (s *Supervisor) handleTask(i Task) {
 		err = s.delete(t)
 	case *ExitTask:
 		err = s.exit(t)
-	case *ExecExitTask:
-		err = s.execExit(t)
 	case *GetContainersTask:
 		err = s.getContainers(t)
 	case *SignalTask:
@@ -379,4 +412,41 @@ func (s *Supervisor) handleTask(i Task) {
 		i.ErrorCh() <- err
 		close(i.ErrorCh())
 	}
+}
+
+func (s *Supervisor) newExecSyncMap(containerID string) {
+	s.containerExecSyncLock.Lock()
+	s.containerExecSync[containerID] = make(map[string]chan struct{})
+	s.containerExecSyncLock.Unlock()
+}
+
+func (s *Supervisor) newExecSyncChannel(containerID, pid string) {
+	s.containerExecSyncLock.Lock()
+	s.containerExecSync[containerID][pid] = make(chan struct{})
+	s.containerExecSyncLock.Unlock()
+}
+
+func (s *Supervisor) deleteExecSyncChannel(containerID, pid string) {
+	s.containerExecSyncLock.Lock()
+	delete(s.containerExecSync[containerID], pid)
+	s.containerExecSyncLock.Unlock()
+}
+
+func (s *Supervisor) getExecSyncChannel(containerID, pid string) chan struct{} {
+	s.containerExecSyncLock.Lock()
+	ch := s.containerExecSync[containerID][pid]
+	s.containerExecSyncLock.Unlock()
+	return ch
+}
+
+func (s *Supervisor) getExecSyncMap(containerID string) map[string]chan struct{} {
+	s.containerExecSyncLock.Lock()
+	defer s.containerExecSyncLock.Unlock()
+	return s.containerExecSync[containerID]
+}
+
+func (s *Supervisor) deleteExecSyncMap(containerID string) {
+	s.containerExecSyncLock.Lock()
+	defer s.containerExecSyncLock.Unlock()
+	delete(s.containerExecSync, containerID)
 }

@@ -4,47 +4,75 @@ import (
 	"errors"
 	"time"
 
-	"github.com/docker/containerd/specs"
+	"github.com/containerd/containerd/specs"
 )
 
 var (
-	ErrNotChildProcess       = errors.New("containerd: not a child process for container")
-	ErrInvalidContainerType  = errors.New("containerd: invalid container type for runtime")
-	ErrCheckpointNotExists   = errors.New("containerd: checkpoint does not exist for container")
-	ErrCheckpointExists      = errors.New("containerd: checkpoint already exists")
-	ErrContainerExited       = errors.New("containerd: container has exited")
-	ErrTerminalsNotSupported = errors.New("containerd: terminals are not supported for runtime")
-	ErrProcessNotExited      = errors.New("containerd: process has not exited")
-	ErrProcessExited         = errors.New("containerd: process has exited")
-	ErrContainerNotStarted   = errors.New("containerd: container not started")
+	// ErrContainerExited is returned when access to an exited
+	// container is attempted
+	ErrContainerExited = errors.New("containerd: container has exited")
+	// ErrOOMNotSupported is returned when the kernel offers no cgroup v1
+	// memory event file for the container (cgroup v2, or no cgroups at all)
+	ErrOOMNotSupported = errors.New("containerd: OOM notification not supported")
+	// ErrProcessNotExited is returned when trying to retrieve the exit
+	// status of an alive process
+	ErrProcessNotExited = errors.New("containerd: process has not exited")
+	// ErrContainerNotStarted is returned when a container fails to
+	// start without error from the shim or the OCI runtime
+	ErrContainerNotStarted = errors.New("containerd: container not started")
+	// ErrContainerStartTimeout is returned if a container takes too
+	// long to start
 	ErrContainerStartTimeout = errors.New("containerd: container did not start before the specified timeout")
+	// ErrShimExited is returned if the shim or the contianer's init process
+	// exits before completing
+	ErrShimExited = errors.New("containerd: shim exited before container process was started")
 
-	errNoPidFile      = errors.New("containerd: no process pid file found")
-	errInvalidPidInt  = errors.New("containerd: process pid is invalid")
-	errNotImplemented = errors.New("containerd: not implemented")
+	errNoPidFile         = errors.New("containerd: no process pid file found")
+	errInvalidPidInt     = errors.New("containerd: process pid is invalid")
+	errContainerNotFound = errors.New("containerd: container not found")
+	errNotImplemented    = errors.New("containerd: not implemented")
 )
 
 const (
-	ExitFile       = "exit"
+	// ExitFile holds the name of the pipe used to monitor process
+	// exit
+	ExitFile = "exit"
+	// ExitStatusFile holds the name of the file where the container
+	// exit code is to be written
 	ExitStatusFile = "exitStatus"
-	StateFile      = "state.json"
-	ControlFile    = "control"
-	InitProcessID  = "init"
+	// StateFile holds the name of the file where the container state
+	// is written
+	StateFile = "state.json"
+	// ControlFile holds the name of the pipe used to control the shim
+	ControlFile = "control"
+	// InitProcessID holds the special ID used for the very first
+	// container's process
+	InitProcessID = "init"
+	// StartTimeFile holds the name of the file in which the process
+	// start time is saved
+	StartTimeFile = "starttime"
+
+	// UnknownStatus is the value returned when a process exit
+	// status cannot be determined
+	UnknownStatus = 255
 )
 
+// Checkpoint holds information regarding a container checkpoint
 type Checkpoint struct {
 	// Timestamp is the time that checkpoint happened
 	Created time.Time `json:"created"`
 	// Name is the name of the checkpoint
 	Name string `json:"name"`
-	// Tcp checkpoints open tcp connections
-	Tcp bool `json:"tcp"`
+	// TCP checkpoints open tcp connections
+	TCP bool `json:"tcp"`
 	// UnixSockets persists unix sockets in the checkpoint
 	UnixSockets bool `json:"unixSockets"`
 	// Shell persists tty sessions in the checkpoint
 	Shell bool `json:"shell"`
 	// Exit exits the container after the checkpoint is finished
 	Exit bool `json:"exit"`
+	// EmptyNS tells CRIU to omit a specified namespace
+	EmptyNS []string `json:"emptyNS,omitempty"`
 }
 
 // PlatformProcessState container platform-specific fields in the ProcessState structure
@@ -53,8 +81,11 @@ type PlatformProcessState struct {
 	RootUID    int    `json:"rootUID"`
 	RootGID    int    `json:"rootGID"`
 }
+
+// State represents a container state
 type State string
 
+// Resource regroups the various container limits that can be updated
 type Resource struct {
 	CPUShares         int64
 	BlkioWeight       uint16
@@ -63,11 +94,14 @@ type Resource struct {
 	CpusetCpus        string
 	CpusetMems        string
 	KernelMemory      int64
+	KernelTCPMemory   int64
 	Memory            int64
 	MemoryReservation int64
 	MemorySwap        int64
+	PidsLimit         int64
 }
 
+// Possible container states
 const (
 	Paused  = State("paused")
 	Stopped = State("stopped")
@@ -86,6 +120,8 @@ type state struct {
 	NoPivotRoot bool     `json:"noPivotRoot"`
 }
 
+// ProcessState holds the process OCI specs along with various fields
+// required by containerd
 type ProcessState struct {
 	specs.ProcessSpec
 	Exec        bool     `json:"exec"`

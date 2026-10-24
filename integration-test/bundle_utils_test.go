@@ -7,8 +7,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 
-	utils "github.com/docker/containerd/testutils"
+	utils "github.com/containerd/containerd/testutils"
 	ocs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -28,11 +29,18 @@ var bundleMap map[string]Bundle
 
 // untarRootfs untars the given `source` tarPath into `destination/rootfs`
 func untarRootfs(source string, destination string) error {
-	destination = filepath.Join(destination, "rootfs")
+	var tar *exec.Cmd
+	if runtime.GOOS == "solaris" {
+		destination = filepath.Join(destination, "/rootfs/root")
+		tar = exec.Command("gtar", "-C", destination, "-xf", source)
+	} else {
+		destination = filepath.Join(destination, "rootfs")
+		tar = exec.Command("tar", "-C", destination, "-xf", source)
+	}
+
 	if err := os.MkdirAll(destination, 0755); err != nil {
 		return nil
 	}
-	tar := exec.Command("tar", "-C", destination, "-xf", source)
 	return tar.Run()
 }
 
@@ -44,14 +52,14 @@ func untarRootfs(source string, destination string) error {
 func CreateBundleWithFilter(source, name string, args []string, filter func(spec *ocs.Spec)) error {
 	// Generate the spec
 	var spec ocs.Spec
-	if f, err := os.Open(utils.RefOciSpecsPath); err != nil {
+	f, err := os.Open(utils.RefOciSpecsPath)
+	if err != nil {
 		return fmt.Errorf("Failed to open default spec: %v", err)
-	} else {
-		if err := json.NewDecoder(f).Decode(&spec); err != nil {
-			return fmt.Errorf("Failed to load default spec: %v", err)
-		}
-		f.Close()
 	}
+	if err := json.NewDecoder(f).Decode(&spec); err != nil {
+		return fmt.Errorf("Failed to load default spec: %v", err)
+	}
+	f.Close()
 
 	spec.Process.Args = args
 	spec.Process.Terminal = false
@@ -74,7 +82,14 @@ func CreateBundleWithFilter(source, name string, args []string, filter func(spec
 	// Nothing should be there, but just in case
 	os.RemoveAll(bundlePath)
 
-	if err := untarRootfs(filepath.Join(utils.ArchivesDir, source+".tar"), bundlePath); err != nil {
+	var sourceStr string
+	if runtime.GOOS == "solaris" {
+		sourceStr = source + ".tar.gz"
+	} else {
+		sourceStr = source + ".tar"
+	}
+
+	if err := untarRootfs(filepath.Join(utils.ArchivesDir, sourceStr), bundlePath); err != nil {
 		return fmt.Errorf("Failed to untar %s.tar: %v", source, err)
 	}
 
@@ -108,4 +123,8 @@ func GetBundle(name string) *Bundle {
 
 func CreateBusyboxBundle(name string, args []string) error {
 	return CreateBundleWithFilter("busybox", name, args, nil)
+}
+
+func CreateSolarisBundle(name string, args []string) error {
+	return CreateBundleWithFilter("rootfs", name, args, nil)
 }

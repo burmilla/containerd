@@ -6,25 +6,29 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
-	"github.com/docker/containerd/specs"
-	"github.com/docker/containerd/subreaper/exec"
+	"github.com/Sirupsen/logrus"
+	"github.com/containerd/containerd/specs"
 	ocs "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/sirupsen/logrus"
+	"golang.org/x/net/context"
+	"golang.org/x/sys/unix"
 )
 
+// Container defines the operations allowed on a container
 type Container interface {
 	// ID returns the container ID
 	ID() string
 	// Path returns the path to the bundle
 	Path() string
 	// Start starts the init process of the container
-	Start(checkpointPath string, s Stdio) (Process, error)
+	Start(ctx context.Context, checkpointPath string, s Stdio) (Process, error)
 	// Exec starts another process in an existing container
-	Exec(string, specs.ProcessSpec, Stdio) (Process, error)
+	Exec(context.Context, string, specs.ProcessSpec, Stdio) (Process, error)
 	// Delete removes the container's state and any resources
 	Delete() error
 	// Processes returns all the containers processes that have been added
@@ -51,6 +55,8 @@ type Container interface {
 	Stats() (*Stat, error)
 	// Name or path of the OCI compliant runtime used to execute the container
 	Runtime() string
+	// OOM signals the channel if the container received an OOM notification
+	OOM() (OOM, error)
 	// UpdateResource updates the containers resources to new values
 	UpdateResources(*Resource) error
 
@@ -58,6 +64,7 @@ type Container interface {
 	Status() (State, error)
 }
 
+// OOM wraps a container OOM.
 type OOM interface {
 	io.Closer
 	FD() int
@@ -66,12 +73,15 @@ type OOM interface {
 	Removed() bool
 }
 
+// Stdio holds the path to the 3 pipes used for the standard ios.
 type Stdio struct {
 	Stdin  string
 	Stdout string
 	Stderr string
 }
 
+// NewStdio wraps the given standard io path into an Stdio struct.
+// If a given parameter is the empty string, it is replaced by "/dev/null"
 func NewStdio(stdin, stdout, stderr string) Stdio {
 	for _, s := range []*string{
 		&stdin, &stdout, &stderr,
@@ -87,6 +97,7 @@ func NewStdio(stdin, stdout, stderr string) Stdio {
 	}
 }
 
+// ContainerOpts keeps the options passed at container creation
 type ContainerOpts struct {
 	Root        string
 	ID          string
@@ -106,7 +117,7 @@ func New(opts ContainerOpts) (Container, error) {
 		id:          opts.ID,
 		bundle:      opts.Bundle,
 		labels:      opts.Labels,
-		processes:   make(map[string]Process),
+		processes:   make(map[string]*process),
 		runtime:     opts.Runtime,
 		runtimeArgs: opts.RuntimeArgs,
 		shim:        opts.Shim,
@@ -134,7 +145,8 @@ func New(opts ContainerOpts) (Container, error) {
 	return c, nil
 }
 
-func Load(root, id string, timeout time.Duration) (Container, error) {
+// Load return a new container from the matchin state file on disk.
+func Load(root, id, shimName string, timeout time.Duration) (Container, error) {
 	var s state
 	f, err := os.Open(filepath.Join(root, id, StateFile))
 	if err != nil {
@@ -153,9 +165,14 @@ func Load(root, id string, timeout time.Duration) (Container, error) {
 		runtimeArgs: s.RuntimeArgs,
 		shim:        s.Shim,
 		noPivotRoot: s.NoPivotRoot,
-		processes:   make(map[string]Process),
+		processes:   make(map[string]*process),
 		timeout:     timeout,
 	}
+
+	if c.shim == "" {
+		c.shim = shimName
+	}
+
 	dirs, err := ioutil.ReadDir(filepath.Join(root, id))
 	if err != nil {
 		return nil, err
@@ -171,10 +188,21 @@ func Load(root, id string, timeout time.Duration) (Container, error) {
 		}
 		p, err := loadProcess(filepath.Join(root, id, pid), pid, c, s)
 		if err != nil {
-			logrus.WithField("id", id).WithField("pid", pid).Debug("containerd: error loading process %s", err)
+			logrus.WithField("id", id).WithField("pid", pid).Debugf("containerd: error loading process %s", err)
 			continue
 		}
 		c.processes[pid] = p
+	}
+
+	_, err = os.Stat(c.bundle)
+	if err != nil && !os.IsExist(err) {
+		for key, p := range c.processes {
+			if key == InitProcessID {
+				p.Delete()
+				break
+			}
+		}
+		return nil, fmt.Errorf("bundle dir %s don't exist", c.bundle)
 	}
 	return c, nil
 }
@@ -200,7 +228,7 @@ type container struct {
 	runtime     string
 	runtimeArgs []string
 	shim        string
-	processes   map[string]Process
+	processes   map[string]*process
 	labels      []string
 	oomFds      []int
 	noPivotRoot bool
@@ -233,12 +261,17 @@ func (c *container) readSpec() (*specs.Spec, error) {
 }
 
 func (c *container) Delete() error {
-	err := os.RemoveAll(filepath.Join(c.root, c.id))
-
-	args := c.runtimeArgs
-	args = append(args, "delete", c.id)
-	if derr := exec.Command(c.runtime, args...).Run(); err == nil {
-		err = derr
+	var err error
+	args := append(c.runtimeArgs, "delete", c.id)
+	if b, derr := exec.Command(c.runtime, args...).CombinedOutput(); derr != nil && !strings.Contains(string(b), "does not exist") && !strings.Contains(string(b), "No such file or directory") {
+		err = fmt.Errorf("%s: %q", derr, string(b))
+	}
+	if rerr := os.RemoveAll(filepath.Join(c.root, c.id)); rerr != nil {
+		if err != nil {
+			err = fmt.Errorf("%s; failed to remove %s: %s", err, filepath.Join(c.root, c.id), rerr)
+		} else {
+			err = rerr
+		}
 	}
 	return err
 }
@@ -257,7 +290,7 @@ func (c *container) RemoveProcess(pid string) error {
 }
 
 func (c *container) State() State {
-	proc := c.processes["init"]
+	proc := c.processes[InitProcessID]
 	if proc == nil {
 		return Stopped
 	}
@@ -342,6 +375,7 @@ func (c *container) Checkpoint(cpt Checkpoint, checkpointDir string) error {
 	args := []string{
 		"checkpoint",
 		"--image-path", path,
+		"--work-path", filepath.Join(path, "criu.work"),
 	}
 	add := func(flags ...string) {
 		args = append(args, flags...)
@@ -353,11 +387,14 @@ func (c *container) Checkpoint(cpt Checkpoint, checkpointDir string) error {
 	if cpt.Shell {
 		add("--shell-job")
 	}
-	if cpt.Tcp {
+	if cpt.TCP {
 		add("--tcp-established")
 	}
 	if cpt.UnixSockets {
 		add("--ext-unix-sk")
+	}
+	for _, ns := range cpt.EmptyNS {
+		add("--empty-ns", ns)
 	}
 	add(c.id)
 	out, err := exec.Command(c.runtime, args...).CombinedOutput()
@@ -374,10 +411,17 @@ func (c *container) DeleteCheckpoint(name string, checkpointDir string) error {
 	return os.RemoveAll(filepath.Join(checkpointDir, name))
 }
 
-func (c *container) Start(checkpointPath string, s Stdio) (Process, error) {
+func (c *container) Start(ctx context.Context, checkpointPath string, s Stdio) (Process, error) {
 	processRoot := filepath.Join(c.root, c.id, InitProcessID)
 	if err := os.Mkdir(processRoot, 0755); err != nil {
 		return nil, err
+	}
+	cmd := exec.Command(c.shim,
+		c.id, c.bundle, c.runtime,
+	)
+	cmd.Dir = processRoot
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
 	}
 	spec, err := c.readSpec()
 	if err != nil {
@@ -392,18 +436,17 @@ func (c *container) Start(checkpointPath string, s Stdio) (Process, error) {
 		spec:        spec,
 		processSpec: specs.ProcessSpec(spec.Process),
 	}
-	p, err := c.newProcess(config)
+	p, err := newProcess(config)
 	if err != nil {
 		return nil, err
 	}
-	if err := p.Start(); err != nil {
+	if err := c.createCmd(ctx, InitProcessID, cmd, p); err != nil {
 		return nil, err
 	}
-	c.processes[InitProcessID] = p
 	return p, nil
 }
 
-func (c *container) Exec(pid string, pspec specs.ProcessSpec, s Stdio) (pp Process, err error) {
+func (c *container) Exec(ctx context.Context, pid string, pspec specs.ProcessSpec, s Stdio) (pp Process, err error) {
 	processRoot := filepath.Join(c.root, c.id, pid)
 	if err := os.Mkdir(processRoot, 0755); err != nil {
 		return nil, err
@@ -413,6 +456,13 @@ func (c *container) Exec(pid string, pspec specs.ProcessSpec, s Stdio) (pp Proce
 			c.RemoveProcess(pid)
 		}
 	}()
+	cmd := exec.Command(c.shim,
+		c.id, c.bundle, c.runtime,
+	)
+	cmd.Dir = processRoot
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
 	spec, err := c.readSpec()
 	if err != nil {
 		return nil, err
@@ -426,38 +476,83 @@ func (c *container) Exec(pid string, pspec specs.ProcessSpec, s Stdio) (pp Proce
 		spec:        spec,
 		stdio:       s,
 	}
-	p, err := c.newProcess(config)
+	p, err := newProcess(config)
 	if err != nil {
 		return nil, err
 	}
-	if err := p.Start(); err != nil {
+	if err := c.createCmd(ctx, pid, cmd, p); err != nil {
 		return nil, err
 	}
-	c.processes[pid] = p
 	return p, nil
 }
 
-func hostIDFromMap(id uint32, mp []ocs.IDMapping) int {
+func (c *container) createCmd(ctx context.Context, pid string, cmd *exec.Cmd, p *process) error {
+	p.cmd = cmd
+	if err := cmd.Start(); err != nil {
+		close(p.cmdDoneCh)
+		if exErr, ok := err.(*exec.Error); ok {
+			if exErr.Err == exec.ErrNotFound || exErr.Err == os.ErrNotExist {
+				return fmt.Errorf("%s not installed on system", c.shim)
+			}
+		}
+		return err
+	}
+	// We need the pid file to have been written to run
+	defer func() {
+		go func() {
+			err := p.cmd.Wait()
+			if err == nil {
+				p.cmdSuccess = true
+			}
+
+			if same, err := p.isSameProcess(); same && p.pid > 0 {
+				// The process changed its PR_SET_PDEATHSIG, so force
+				// kill it
+				logrus.Infof("containerd: %s:%s (pid %v) has become an orphan, killing it", p.container.id, p.id, p.pid)
+				err = unix.Kill(p.pid, syscall.SIGKILL)
+				if err != nil && err != syscall.ESRCH {
+					logrus.Errorf("containerd: unable to SIGKILL %s:%s (pid %v): %v", p.container.id, p.id, p.pid, err)
+				} else {
+					for {
+						err = unix.Kill(p.pid, 0)
+						if err != nil {
+							break
+						}
+						time.Sleep(5 * time.Millisecond)
+					}
+				}
+			}
+			close(p.cmdDoneCh)
+		}()
+	}()
+
+	ch := make(chan error)
+	go func() {
+		if err := c.waitForCreate(p, cmd); err != nil {
+			ch <- err
+			return
+		}
+		c.processes[pid] = p
+		ch <- nil
+	}()
+	select {
+	case <-ctx.Done():
+		cmd.Process.Kill()
+		cmd.Wait()
+		<-ch
+		return ctx.Err()
+	case err := <-ch:
+		return err
+	}
+}
+
+func hostIDFromMap(id uint32, mp []ocs.LinuxIDMapping) int {
 	for _, m := range mp {
 		if (id >= m.ContainerID) && (id <= (m.ContainerID + m.Size - 1)) {
 			return int(m.HostID + (id - m.ContainerID))
 		}
 	}
 	return 0
-}
-
-func (c *container) Pids() ([]int, error) {
-	args := c.runtimeArgs
-	args = append(args, "ps", "--format=json", c.id)
-	out, err := exec.Command(c.runtime, args...).CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("%s: %q", err.Error(), out)
-	}
-	var pids []int
-	if err := json.Unmarshal(out, &pids); err != nil {
-		return nil, err
-	}
-	return pids, nil
 }
 
 func (c *container) Stats() (*Stat, error) {
@@ -499,14 +594,13 @@ func (c *container) Status() (State, error) {
 }
 
 func (c *container) writeEventFD(root string, cfd, efd int) error {
-	return nil
-}
-
-func (c *container) newProcess(config *processConfig) (Process, error) {
-	if c.shim == "" {
-		return newDirectProcess(config)
+	f, err := os.OpenFile(filepath.Join(root, "cgroup.event_control"), os.O_WRONLY, 0)
+	if err != nil {
+		return err
 	}
-	return newProcess(config)
+	defer f.Close()
+	_, err = f.WriteString(fmt.Sprintf("%d %d", efd, cfd))
+	return err
 }
 
 type waitArgs struct {
@@ -514,8 +608,82 @@ type waitArgs struct {
 	err error
 }
 
+func (c *container) waitForCreate(p *process, cmd *exec.Cmd) error {
+	wc := make(chan error, 1)
+	go func() {
+		for {
+			if _, err := p.getPidFromFile(); err != nil {
+				if os.IsNotExist(err) || err == errInvalidPidInt || err == errContainerNotFound {
+					alive, err := isAlive(cmd)
+					if err != nil {
+						wc <- err
+						return
+					}
+					if !alive {
+						// runc could have failed to run the container so lets get the error
+						// out of the logs or the shim could have encountered an error
+						messages, err := readLogMessages(filepath.Join(p.root, "shim-log.json"))
+						if err != nil {
+							wc <- err
+							return
+						}
+						for _, m := range messages {
+							if m.Level == "error" {
+								wc <- fmt.Errorf("shim error: %v", m.Msg)
+								return
+							}
+						}
+						// no errors reported back from shim, check for runc/runtime errors
+						messages, err = readLogMessages(filepath.Join(p.root, "log.json"))
+						if err != nil {
+							if os.IsNotExist(err) {
+								err = ErrContainerNotStarted
+							}
+							wc <- err
+							return
+						}
+						for _, m := range messages {
+							if m.Level == "error" {
+								wc <- fmt.Errorf("oci runtime error: %v", m.Msg)
+								return
+							}
+						}
+						wc <- ErrContainerNotStarted
+						return
+					}
+					time.Sleep(15 * time.Millisecond)
+					continue
+				}
+				wc <- err
+				return
+			}
+			// the pid file was read successfully
+			wc <- nil
+			return
+		}
+	}()
+	select {
+	case err := <-wc:
+		if err != nil {
+			return err
+		}
+		err = p.saveStartTime()
+		if err != nil && !os.IsNotExist(err) {
+			logrus.Warnf("containerd: unable to save %s:%s starttime: %v", p.container.id, p.id, err)
+		}
+		return nil
+	case <-time.After(c.timeout):
+		cmd.Process.Kill()
+		cmd.Wait()
+		return ErrContainerStartTimeout
+	}
+}
+
 // isAlive checks if the shim that launched the container is still alive
 func isAlive(cmd *exec.Cmd) (bool, error) {
+	if _, err := syscall.Wait4(cmd.Process.Pid, nil, syscall.WNOHANG, nil); err == nil {
+		return true, nil
+	}
 	if err := syscall.Kill(cmd.Process.Pid, 0); err != nil {
 		if err == syscall.ESRCH {
 			return false, nil
@@ -528,7 +696,6 @@ func isAlive(cmd *exec.Cmd) (bool, error) {
 type oom struct {
 	id      string
 	root    string
-	control *os.File
 	eventfd int
 }
 
@@ -546,15 +713,12 @@ func (o *oom) Flush() {
 }
 
 func (o *oom) Removed() bool {
-	return true
+	_, err := os.Lstat(filepath.Join(o.root, "cgroup.event_control"))
+	return os.IsNotExist(err)
 }
 
 func (o *oom) Close() error {
-	err := syscall.Close(o.eventfd)
-	if cerr := o.control.Close(); err == nil {
-		err = cerr
-	}
-	return err
+	return syscall.Close(o.eventfd)
 }
 
 type message struct {

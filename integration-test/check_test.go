@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -18,14 +17,12 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/grpclog"
+	"google.golang.org/grpc/health/grpc_health_v1"
 
-	"github.com/docker/containerd/api/grpc/types"
-	utils "github.com/docker/containerd/testutils"
+	"github.com/containerd/containerd/api/grpc/types"
+	utils "github.com/containerd/containerd/testutils"
 	"github.com/go-check/check"
-)
-
-var (
-	ShimFlag = flag.String("containerd.shim", "containerd-shim", "containerd shim to use")
+	"github.com/golang/protobuf/ptypes/timestamp"
 )
 
 func Test(t *testing.T) {
@@ -33,7 +30,7 @@ func Test(t *testing.T) {
 }
 
 func init() {
-	check.Suite(&ContainerdSuite{lastEventTs: uint64(time.Now().Unix())})
+	check.Suite(&ContainerdSuite{})
 }
 
 type ContainerdSuite struct {
@@ -47,7 +44,7 @@ type ContainerdSuite struct {
 	grpcClient        types.APIClient
 	eventFiltersMutex sync.Mutex
 	eventFilters      map[string]func(event *types.Event)
-	lastEventTs       uint64
+	lastEventTs       *timestamp.Timestamp
 }
 
 // getClient returns a connection to the Suite containerd
@@ -64,10 +61,16 @@ func (cs *ContainerdSuite) getClient(socket string) error {
 	dialOpts = append(dialOpts,
 		grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
 			return net.DialTimeout(bindParts[0], bindParts[1], timeout)
-		},
-		))
+		}),
+		grpc.WithBlock(),
+		grpc.WithTimeout(5*time.Second),
+	)
 	conn, err := grpc.Dial(socket, dialOpts...)
 	if err != nil {
+		return err
+	}
+	healthClient := grpc_health_v1.NewHealthClient(conn)
+	if _, err := healthClient.Check(context.Background(), &grpc_health_v1.HealthCheckRequest{}); err != nil {
 		return err
 	}
 	cs.grpcClient = types.NewAPIClient(conn)
@@ -111,7 +114,6 @@ func (cs *ContainerdSuite) StopDaemon(kill bool) {
 	if kill {
 		cs.cd.Process.Kill()
 		<-cs.syncChild
-		cs.cd = nil
 	} else {
 		// Terminate gently if possible
 		cs.cd.Process.Signal(os.Interrupt)
@@ -130,13 +132,11 @@ func (cs *ContainerdSuite) StopDaemon(kill bool) {
 			}
 		}
 	}
+	cs.cd = nil
 }
 
-func (cs *ContainerdSuite) RestartDaemon(kill bool) error {
-	cs.StopDaemon(kill)
-
+func (cs *ContainerdSuite) StartDaemon() error {
 	cd := exec.Command("containerd", "--debug",
-		"--shim", *ShimFlag,
 		"--state-dir", cs.stateDir,
 		"--listen", cs.grpcSocket,
 		"--metrics-interval", "0m0s",
@@ -169,6 +169,11 @@ func (cs *ContainerdSuite) RestartDaemon(kill bool) error {
 	}()
 
 	return nil
+}
+
+func (cs *ContainerdSuite) RestartDaemon(kill bool) error {
+	cs.StopDaemon(kill)
+	return cs.StartDaemon()
 }
 
 func (cs *ContainerdSuite) SetUpSuite(c *check.C) {
@@ -264,13 +269,13 @@ func (cs *ContainerdSuite) TearDownTest(c *check.C) {
 		})
 
 		if err := cs.KillContainer(ctr.Id); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to cleanup leftover test containers: %v", err)
+			fmt.Fprintf(os.Stderr, "Failed to cleanup leftover test containers: %v\n", err)
 		}
 
 		select {
 		case <-ch:
 		case <-time.After(3 * time.Second):
-			fmt.Fprintf(os.Stderr, "TearDownTest: Containerd %v didn't die after 3 seconds", ctr.Id)
+			fmt.Fprintf(os.Stderr, "TearDownTest: Containerd %v didn't die after 3 seconds\n", ctr.Id)
 		}
 	}
 }

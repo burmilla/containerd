@@ -6,24 +6,26 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
 
-	"github.com/codegangsta/cli"
-	graphite "github.com/cyberdelia/go-metrics-graphite"
-	"github.com/docker/containerd"
-	"github.com/docker/containerd/api/grpc/server"
-	"github.com/docker/containerd/api/grpc/types"
-	"github.com/docker/containerd/api/http/pprof"
-	"github.com/docker/containerd/subreaper"
-	"github.com/docker/containerd/supervisor"
+	"github.com/Sirupsen/logrus"
+	"github.com/urfave/cli"
+	"github.com/cyberdelia/go-metrics-graphite"
+	"github.com/containerd/containerd"
+	grpcserver "github.com/containerd/containerd/api/grpc/server"
+	"github.com/containerd/containerd/api/grpc/types"
+	"github.com/containerd/containerd/api/http/pprof"
+	"github.com/containerd/containerd/supervisor"
 	"github.com/docker/docker/pkg/listeners"
 	"github.com/rcrowley/go-metrics"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -37,6 +39,10 @@ var daemonFlags = []cli.Flag{
 	cli.BoolFlag{
 		Name:  "debug",
 		Usage: "enable debug output in the logs",
+	},
+	cli.StringFlag{
+		Name:  "log-level",
+		Usage: "Set the logging level [debug, info, warn, error, fatal, panic]",
 	},
 	cli.StringFlag{
 		Name:  "state-dir",
@@ -74,7 +80,7 @@ var daemonFlags = []cli.Flag{
 	},
 	cli.DurationFlag{
 		Name:  "start-timeout",
-		Value: 15 * time.Second,
+		Value: 30 * time.Second,
 		Usage: "timeout duration for waiting on a container to start before it is killed",
 	},
 	cli.IntFlag{
@@ -86,6 +92,32 @@ var daemonFlags = []cli.Flag{
 		Name:  "graphite-address",
 		Usage: "Address of graphite server",
 	},
+}
+
+// DumpStacks dumps the runtime stack.
+func dumpStacks() {
+	var (
+		buf       []byte
+		stackSize int
+	)
+	bufferLen := 16384
+	for stackSize == len(buf) {
+		buf = make([]byte, bufferLen)
+		stackSize = runtime.Stack(buf, true)
+		bufferLen *= 2
+	}
+	buf = buf[:stackSize]
+	logrus.Infof("=== BEGIN goroutine stack dump ===\n%s\n=== END goroutine stack dump ===", buf)
+}
+
+func setupDumpStacksTrap() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGUSR1)
+	go func() {
+		for range c {
+			dumpStacks()
+		}
+	}()
 }
 
 func main() {
@@ -100,6 +132,7 @@ func main() {
 	app.Usage = usage
 	app.Flags = daemonFlags
 	app.Before = func(context *cli.Context) error {
+		setupDumpStacksTrap()
 		if context.GlobalBool("debug") {
 			logrus.SetLevel(logrus.DebugLevel)
 			if context.GlobalDuration("metrics-interval") > 0 {
@@ -107,7 +140,14 @@ func main() {
 					return err
 				}
 			}
-
+		}
+		if logLevel := context.GlobalString("log-level"); logLevel != "" {
+			lvl, err := logrus.ParseLevel(logLevel)
+			if err != nil {
+				lvl = logrus.InfoLevel
+				fmt.Fprintf(os.Stderr, "Unable to parse logging level: %s\n, and being defaulted to info", logLevel)
+			}
+			logrus.SetLevel(lvl)
 		}
 		if p := context.GlobalString("pprof-address"); len(p) > 0 {
 			pprof.Enable(p)
@@ -129,15 +169,25 @@ func main() {
 }
 
 func daemon(context *cli.Context) error {
-	// setup a standard reaper so that we don't leave any zombies if we are still alive
-	// this is just good practice because we are spawning new processes
+	stateDir := context.String("state-dir")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		return err
+	}
 	s := make(chan os.Signal, 2048)
 	signal.Notify(s, syscall.SIGTERM, syscall.SIGINT)
-	if err := subreaper.Start(); err != nil {
-		logrus.WithField("error", err).Error("containerd: set subpreaper")
+	// Split the listen string of the form proto://addr
+	listenSpec := context.String("listen")
+	listenParts := strings.SplitN(listenSpec, "://", 2)
+	if len(listenParts) != 2 {
+		return fmt.Errorf("bad listen address format %s, expected proto://address", listenSpec)
+	}
+	// Register server early to allow healthcheck to be done
+	server, err := startServer(listenParts[0], listenParts[1])
+	if err != nil {
+		return err
 	}
 	sv, err := supervisor.New(
-		context.String("state-dir"),
+		stateDir,
 		context.String("runtime"),
 		context.String("shim"),
 		context.StringSlice("runtime-args"),
@@ -146,6 +196,7 @@ func daemon(context *cli.Context) error {
 	if err != nil {
 		return err
 	}
+	types.RegisterAPIServer(server, grpcserver.NewServer(sv))
 	wg := &sync.WaitGroup{}
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
@@ -155,25 +206,20 @@ func daemon(context *cli.Context) error {
 	if err := sv.Start(); err != nil {
 		return err
 	}
-	// Split the listen string of the form proto://addr
-	listenSpec := context.String("listen")
-	listenParts := strings.SplitN(listenSpec, "://", 2)
-	if len(listenParts) != 2 {
-		return fmt.Errorf("bad listen address format %s, expected proto://address", listenSpec)
-	}
-	server, err := startServer(listenParts[0], listenParts[1], sv)
-	if err != nil {
-		return err
-	}
 	for ss := range s {
-		logrus.Infof("stopping containerd after receiving %s", ss)
-		server.Stop()
-		os.Exit(0)
+		switch ss {
+		case syscall.SIGPIPE:
+			continue
+		default:
+			logrus.Infof("stopping containerd after receiving %s", ss)
+			server.Stop()
+			os.Exit(0)
+		}
 	}
 	return nil
 }
 
-func startServer(protocol, address string, sv *supervisor.Supervisor) (*grpc.Server, error) {
+func startServer(protocol, address string) (*grpc.Server, error) {
 	// TODO: We should use TLS.
 	// TODO: Add an option for the SocketGroup.
 	sockets, err := listeners.Init(protocol, address, "", nil)
@@ -185,7 +231,9 @@ func startServer(protocol, address string, sv *supervisor.Supervisor) (*grpc.Ser
 	}
 	l := sockets[0]
 	s := grpc.NewServer()
-	types.RegisterAPIServer(s, server.NewServer(sv))
+	healthServer := health.NewServer()
+	grpc_health_v1.RegisterHealthServer(s, healthServer)
+
 	go func() {
 		logrus.Debugf("containerd: grpc api on %s", address)
 		if err := s.Serve(l); err != nil {
@@ -193,15 +241,6 @@ func startServer(protocol, address string, sv *supervisor.Supervisor) (*grpc.Ser
 		}
 	}()
 	return s, nil
-}
-
-// getDefaultID returns the hostname for the instance host
-func getDefaultID() string {
-	hostname, err := os.Hostname()
-	if err != nil {
-		panic(err)
-	}
-	return hostname
 }
 
 func checkLimits() error {

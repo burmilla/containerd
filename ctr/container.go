@@ -10,18 +10,22 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
-	"github.com/codegangsta/cli"
-	"github.com/docker/containerd/api/grpc/types"
-	"github.com/docker/containerd/specs"
-	"github.com/docker/docker/pkg/term"
+	"github.com/containerd/containerd/api/grpc/types"
+	"github.com/containerd/containerd/specs"
+	"github.com/containerd/console"
+	"github.com/golang/protobuf/ptypes"
+	"github.com/urfave/cli"
 	netcontext "golang.org/x/net/context"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/grpclog"
+	"google.golang.org/grpc/transport"
 )
 
 // TODO: parse flags and pass opts
@@ -79,19 +83,20 @@ var containersCommand = cli.Command{
 var stateCommand = cli.Command{
 	Name:  "state",
 	Usage: "get a raw dump of the containerd state",
-	Action: func(context *cli.Context) {
+	Action: func(context *cli.Context) error {
 		c := getClient(context)
 		resp, err := c.State(netcontext.Background(), &types.StateRequest{
 			Id: context.Args().First(),
 		})
 		if err != nil {
-			fatal(err.Error(), 1)
+			return err
 		}
 		data, err := json.Marshal(resp)
 		if err != nil {
-			fatal(err.Error(), 1)
+			return err
 		}
 		fmt.Print(string(data))
+		return nil
 	},
 }
 
@@ -101,13 +106,13 @@ var listCommand = cli.Command{
 	Action: listContainers,
 }
 
-func listContainers(context *cli.Context) {
+func listContainers(context *cli.Context) error {
 	c := getClient(context)
 	resp, err := c.State(netcontext.Background(), &types.StateRequest{
 		Id: context.Args().First(),
 	})
 	if err != nil {
-		fatal(err.Error(), 1)
+		return err
 	}
 	w := tabwriter.NewWriter(os.Stdout, 20, 1, 3, ' ', 0)
 	fmt.Fprint(w, "ID\tPATH\tSTATUS\tPROCESSES\n")
@@ -119,9 +124,7 @@ func listContainers(context *cli.Context) {
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", c.Id, c.BundlePath, c.Status, strings.Join(procs, ","))
 	}
-	if err := w.Flush(); err != nil {
-		fatal(err.Error(), 1)
-	}
+	return w.Flush()
 }
 
 var startCommand = cli.Command{
@@ -163,7 +166,7 @@ var startCommand = cli.Command{
 			Usage: "specify additional runtime args",
 		},
 	},
-	Action: func(context *cli.Context) {
+	Action: func(context *cli.Context) error {
 		var (
 			id   = context.Args().Get(0)
 			path = context.Args().Get(1)
@@ -176,22 +179,22 @@ var startCommand = cli.Command{
 		}
 		bpath, err := filepath.Abs(path)
 		if err != nil {
-			fatal(fmt.Sprintf("cannot get the absolute path of the bundle: %v", err), 1)
+			return fmt.Errorf("cannot get the absolute path of the bundle: %v", err)
 		}
-		s, err := createStdio()
+		s, tmpDir, err := createStdio()
 		defer func() {
-			if s.stdin != "" {
-				os.RemoveAll(filepath.Dir(s.stdin))
+			if tmpDir != "" {
+				os.RemoveAll(tmpDir)
 			}
 		}()
 		if err != nil {
-			fatal(err.Error(), 1)
+			return err
 		}
 		var (
-			restoreAndCloseStdin func()
-			tty                  bool
-			c                    = getClient(context)
-			r                    = &types.CreateContainerRequest{
+			con console.Console
+			tty bool
+			c   = getClient(context)
+			r   = &types.CreateContainerRequest{
 				Id:            id,
 				BundlePath:    bpath,
 				Checkpoint:    context.String("checkpoint"),
@@ -205,38 +208,32 @@ var startCommand = cli.Command{
 				RuntimeArgs:   context.StringSlice("runtime-args"),
 			}
 		)
-		restoreAndCloseStdin = func() {
-			if state != nil {
-				term.RestoreTerminal(os.Stdin.Fd(), state)
-			}
-			if stdin != nil {
-				stdin.Close()
-			}
-		}
-		defer restoreAndCloseStdin()
 		if context.Bool("attach") {
 			mkterm, err := readTermSetting(bpath)
 			if err != nil {
-				fatal(err.Error(), 1)
+				return err
 			}
 			tty = mkterm
 			if mkterm {
-				s, err := term.SetRawTerminal(os.Stdin.Fd())
-				if err != nil {
-					fatal(err.Error(), 1)
+				con = console.Current()
+				defer func() {
+					con.Reset()
+					con.Close()
+				}()
+				if err := con.SetRaw(); err != nil {
+					return err
 				}
-				state = s
 			}
 			if err := attachStdio(s); err != nil {
-				fatal(err.Error(), 1)
+				return err
 			}
 		}
 		events, err := c.Events(netcontext.Background(), &types.EventsRequest{})
 		if err != nil {
-			fatal(err.Error(), 1)
+			return err
 		}
 		if _, err := c.CreateContainer(netcontext.Background(), r); err != nil {
-			fatal(err.Error(), 1)
+			return err
 		}
 		if context.Bool("attach") {
 			go func() {
@@ -248,27 +245,39 @@ var startCommand = cli.Command{
 				}); err != nil {
 					fatal(err.Error(), 1)
 				}
-				restoreAndCloseStdin()
+				con.Reset()
+				con.Close()
 			}()
 			if tty {
-				resize(id, "init", c)
+				resize(id, "init", c, con)
 				go func() {
 					s := make(chan os.Signal, 64)
 					signal.Notify(s, syscall.SIGWINCH)
 					for range s {
-						if err := resize(id, "init", c); err != nil {
+						if err := resize(id, "init", c, con); err != nil {
 							log.Println(err)
 						}
 					}
 				}()
 			}
-			waitForExit(c, events, id, "init", restoreAndCloseStdin)
+			time.Sleep(2 * time.Second)
+			log.Println("closing stdin now")
+			if _, err := c.UpdateProcess(netcontext.Background(), &types.UpdateProcessRequest{
+				Id:         id,
+				Pid:        "init",
+				CloseStdin: true,
+			}); err != nil {
+				fatal(err.Error(), 1)
+			}
+
+			waitForExit(c, events, id, "init", con)
 		}
+		return nil
 	},
 }
 
-func resize(id, pid string, c types.APIClient) error {
-	ws, err := term.GetWinsize(os.Stdin.Fd())
+func resize(id, pid string, c types.APIClient, con console.Console) error {
+	ws, err := con.Size()
 	if err != nil {
 		return err
 	}
@@ -285,7 +294,6 @@ func resize(id, pid string, c types.APIClient) error {
 
 var (
 	stdin io.WriteCloser
-	state *term.State
 )
 
 // readTermSetting reads the Terminal option out of the specs configuration
@@ -326,13 +334,13 @@ func attachStdio(s stdio) error {
 var watchCommand = cli.Command{
 	Name:  "watch",
 	Usage: "print container events",
-	Action: func(context *cli.Context) {
+	Action: func(context *cli.Context) error {
 		c := getClient(context)
 		id := context.Args().First()
 		if id != "" {
 			resp, err := c.State(netcontext.Background(), &types.StateRequest{Id: id})
 			if err != nil {
-				fatal(err.Error(), 1)
+				return err
 			}
 			for _, c := range resp.Containers {
 				if c.Id == id {
@@ -345,18 +353,19 @@ var watchCommand = cli.Command{
 		}
 		events, reqErr := c.Events(netcontext.Background(), &types.EventsRequest{})
 		if reqErr != nil {
-			fatal(reqErr.Error(), 1)
+			return reqErr
 		}
 
 		for {
 			e, err := events.Recv()
 			if err != nil {
-				fatal(err.Error(), 1)
+				return err
 			}
 
 			if id == "" || e.Id == id {
 				fmt.Printf("%#v\n", e)
 			}
+			return nil
 		}
 	},
 }
@@ -364,7 +373,7 @@ var watchCommand = cli.Command{
 var pauseCommand = cli.Command{
 	Name:  "pause",
 	Usage: "pause a container",
-	Action: func(context *cli.Context) {
+	Action: func(context *cli.Context) error {
 		id := context.Args().First()
 		if id == "" {
 			fatal("container id cannot be empty", ExitStatusMissingArg)
@@ -375,16 +384,14 @@ var pauseCommand = cli.Command{
 			Pid:    "init",
 			Status: "paused",
 		})
-		if err != nil {
-			fatal(err.Error(), 1)
-		}
+		return err
 	},
 }
 
 var resumeCommand = cli.Command{
 	Name:  "resume",
 	Usage: "resume a paused container",
-	Action: func(context *cli.Context) {
+	Action: func(context *cli.Context) error {
 		id := context.Args().First()
 		if id == "" {
 			fatal("container id cannot be empty", ExitStatusMissingArg)
@@ -395,9 +402,7 @@ var resumeCommand = cli.Command{
 			Pid:    "init",
 			Status: "running",
 		})
-		if err != nil {
-			fatal(err.Error(), 1)
-		}
+		return err
 	},
 }
 
@@ -416,19 +421,18 @@ var killCommand = cli.Command{
 			Usage: "signal to send to the container",
 		},
 	},
-	Action: func(context *cli.Context) {
+	Action: func(context *cli.Context) error {
 		id := context.Args().First()
 		if id == "" {
 			fatal("container id cannot be empty", ExitStatusMissingArg)
 		}
 		c := getClient(context)
-		if _, err := c.Signal(netcontext.Background(), &types.SignalRequest{
+		_, err := c.Signal(netcontext.Background(), &types.SignalRequest{
 			Id:     id,
 			Pid:    context.String("pid"),
 			Signal: uint32(context.Int("signal")),
-		}); err != nil {
-			fatal(err.Error(), 1)
-		}
+		})
+		return err
 	},
 }
 
@@ -451,6 +455,7 @@ var execCommand = cli.Command{
 		cli.StringFlag{
 			Name:  "cwd",
 			Usage: "current working directory for the process",
+			Value: "/",
 		},
 		cli.BoolFlag{
 			Name:  "tty,t",
@@ -470,9 +475,7 @@ var execCommand = cli.Command{
 			Usage: "group id of the user for the process",
 		},
 	},
-	Action: func(context *cli.Context) {
-		var restoreAndCloseStdin func()
-
+	Action: func(context *cli.Context) error {
 		p := &types.AddProcessRequest{
 			Id:       context.String("id"),
 			Pid:      context.String("pid"),
@@ -485,46 +488,42 @@ var execCommand = cli.Command{
 				Gid: uint32(context.Int("gid")),
 			},
 		}
-		s, err := createStdio()
+		s, tmpDir, err := createStdio()
 		defer func() {
-			if s.stdin != "" {
-				os.RemoveAll(filepath.Dir(s.stdin))
+			if tmpDir != "" {
+				os.RemoveAll(tmpDir)
 			}
 		}()
 		if err != nil {
-			fatal(err.Error(), 1)
+			return err
 		}
 		p.Stdin = s.stdin
 		p.Stdout = s.stdout
 		p.Stderr = s.stderr
-		restoreAndCloseStdin = func() {
-			if state != nil {
-				term.RestoreTerminal(os.Stdin.Fd(), state)
-			}
-			if stdin != nil {
-				stdin.Close()
-			}
-		}
-		defer restoreAndCloseStdin()
+
+		var con console.Console
 		if context.Bool("attach") {
 			if context.Bool("tty") {
-				s, err := term.SetRawTerminal(os.Stdin.Fd())
-				if err != nil {
-					fatal(err.Error(), 1)
+				con = console.Current()
+				defer func() {
+					con.Reset()
+					con.Close()
+				}()
+				if err := con.SetRaw(); err != nil {
+					return err
 				}
-				state = s
 			}
 			if err := attachStdio(s); err != nil {
-				fatal(err.Error(), 1)
+				return err
 			}
 		}
 		c := getClient(context)
 		events, err := c.Events(netcontext.Background(), &types.EventsRequest{})
 		if err != nil {
-			fatal(err.Error(), 1)
+			return err
 		}
 		if _, err := c.AddProcess(netcontext.Background(), p); err != nil {
-			fatal(err.Error(), 1)
+			return err
 		}
 		if context.Bool("attach") {
 			go func() {
@@ -536,68 +535,88 @@ var execCommand = cli.Command{
 				}); err != nil {
 					log.Println(err)
 				}
-				restoreAndCloseStdin()
+				con.Reset()
+				con.Close()
 			}()
 			if context.Bool("tty") {
-				resize(p.Id, p.Pid, c)
+				resize(p.Id, p.Pid, c, con)
 				go func() {
 					s := make(chan os.Signal, 64)
 					signal.Notify(s, syscall.SIGWINCH)
 					for range s {
-						if err := resize(p.Id, p.Pid, c); err != nil {
+						if err := resize(p.Id, p.Pid, c, con); err != nil {
 							log.Println(err)
 						}
 					}
 				}()
 			}
-			waitForExit(c, events, context.String("id"), context.String("pid"), restoreAndCloseStdin)
+			waitForExit(c, events, context.String("id"), context.String("pid"), con)
 		}
+		return nil
 	},
 }
 
 var statsCommand = cli.Command{
 	Name:  "stats",
 	Usage: "get stats for running container",
-	Action: func(context *cli.Context) {
+	Action: func(context *cli.Context) error {
 		req := &types.StatsRequest{
 			Id: context.Args().First(),
 		}
 		c := getClient(context)
 		stats, err := c.Stats(netcontext.Background(), req)
 		if err != nil {
-			fatal(err.Error(), 1)
+			return err
 		}
 		data, err := json.Marshal(stats)
 		if err != nil {
-			fatal(err.Error(), 1)
+			return err
 		}
 		fmt.Print(string(data))
+		return nil
 	},
+}
+
+func getUpdateCommandInt64Flag(context *cli.Context, name string) uint64 {
+	str := context.String(name)
+	if str == "" {
+		return 0
+	}
+
+	val, err := strconv.ParseUint(str, 0, 64)
+	if err != nil {
+		fatal(err.Error(), 1)
+	}
+
+	return val
 }
 
 var updateCommand = cli.Command{
 	Name:  "update",
 	Usage: "update a containers resources",
 	Flags: []cli.Flag{
-		cli.IntFlag{
+		cli.StringFlag{
 			Name: "memory-limit",
 		},
-		cli.IntFlag{
+		cli.StringFlag{
 			Name: "memory-reservation",
 		},
-		cli.IntFlag{
+		cli.StringFlag{
 			Name: "memory-swap",
 		},
-		cli.IntFlag{
+		cli.StringFlag{
 			Name: "cpu-quota",
 		},
-		cli.IntFlag{
+		cli.StringFlag{
 			Name: "cpu-period",
 		},
-		cli.IntFlag{
+		cli.StringFlag{
 			Name: "kernel-limit",
 		},
-		cli.IntFlag{
+		cli.StringFlag{
+			Name: "kernel-tcp-limit",
+		},
+		cli.StringFlag{
 			Name: "blkio-weight",
 		},
 		cli.StringFlag{
@@ -606,40 +625,64 @@ var updateCommand = cli.Command{
 		cli.StringFlag{
 			Name: "cpuset-mems",
 		},
+		cli.StringFlag{
+			Name: "pids-limit",
+		},
 	},
-	Action: func(context *cli.Context) {
+	Action: func(context *cli.Context) error {
 		req := &types.UpdateContainerRequest{
 			Id: context.Args().First(),
 		}
 		req.Resources = &types.UpdateResource{}
-		req.Resources.MemoryLimit = uint32(context.Int("memory-limit"))
-		req.Resources.MemoryReservation = uint32(context.Int("memory-reservation"))
-		req.Resources.MemorySwap = uint32(context.Int("memory-swap"))
-		req.Resources.BlkioWeight = uint32(context.Int("blkio-weight"))
-		req.Resources.CpuPeriod = uint32(context.Int("cpu-period"))
-		req.Resources.CpuQuota = uint32(context.Int("cpu-quota"))
-		req.Resources.CpuShares = uint32(context.Int("cpu-shares"))
+		req.Resources.MemoryLimit = getUpdateCommandInt64Flag(context, "memory-limit")
+		req.Resources.MemoryReservation = getUpdateCommandInt64Flag(context, "memory-reservation")
+		req.Resources.MemorySwap = getUpdateCommandInt64Flag(context, "memory-swap")
+		req.Resources.BlkioWeight = getUpdateCommandInt64Flag(context, "blkio-weight")
+		req.Resources.CpuPeriod = getUpdateCommandInt64Flag(context, "cpu-period")
+		req.Resources.CpuQuota = getUpdateCommandInt64Flag(context, "cpu-quota")
+		req.Resources.CpuShares = getUpdateCommandInt64Flag(context, "cpu-shares")
 		req.Resources.CpusetCpus = context.String("cpuset-cpus")
 		req.Resources.CpusetMems = context.String("cpuset-mems")
+		req.Resources.KernelMemoryLimit = getUpdateCommandInt64Flag(context, "kernel-limit")
+		req.Resources.KernelTCPMemoryLimit = getUpdateCommandInt64Flag(context, "kernel-tcp-limit")
+		req.Resources.PidsLimit = getUpdateCommandInt64Flag(context, "pids-limit")
 		c := getClient(context)
-		if _, err := c.UpdateContainer(netcontext.Background(), req); err != nil {
-			fatal(err.Error(), 1)
-		}
+		_, err := c.UpdateContainer(netcontext.Background(), req)
+		return err
 	},
 }
 
-func waitForExit(c types.APIClient, events types.API_EventsClient, id, pid string, closer func()) {
-	timestamp := uint64(time.Now().Unix())
+func waitForExit(c types.APIClient, events types.API_EventsClient, id, pid string, con console.Console) {
+	timestamp := time.Now()
 	for {
 		e, err := events.Recv()
 		if err != nil {
+			if grpc.ErrorDesc(err) == transport.ErrConnClosing.Desc {
+				if con != nil {
+					con.Reset()
+					con.Close()
+				}
+				os.Exit(128 + int(syscall.SIGHUP))
+			}
 			time.Sleep(1 * time.Second)
-			events, _ = c.Events(netcontext.Background(), &types.EventsRequest{Timestamp: timestamp})
+			tsp, err := ptypes.TimestampProto(timestamp)
+			if err != nil {
+				if con != nil {
+					con.Reset()
+					con.Close()
+				}
+				fmt.Fprintf(os.Stderr, "%s", err.Error())
+				os.Exit(1)
+			}
+			events, _ = c.Events(netcontext.Background(), &types.EventsRequest{Timestamp: tsp})
 			continue
 		}
-		timestamp = e.Timestamp
+		timestamp, err = ptypes.Timestamp(e.Timestamp)
 		if e.Id == id && e.Type == "exit" && e.Pid == pid {
-			closer()
+			if con != nil {
+				con.Reset()
+				con.Close()
+			}
 			os.Exit(int(e.Status))
 		}
 	}
@@ -649,4 +692,27 @@ type stdio struct {
 	stdin  string
 	stdout string
 	stderr string
+}
+
+func createStdio() (s stdio, tmp string, err error) {
+	tmp, err = ioutil.TempDir("", "ctr-")
+	if err != nil {
+		return s, tmp, err
+	}
+	// create fifo's for the process
+	for _, pair := range []struct {
+		name string
+		fd   *string
+	}{
+		{"stdin", &s.stdin},
+		{"stdout", &s.stdout},
+		{"stderr", &s.stderr},
+	} {
+		path := filepath.Join(tmp, pair.name)
+		if err := unix.Mkfifo(path, 0755); err != nil && !os.IsExist(err) {
+			return s, tmp, err
+		}
+		*pair.fd = path
+	}
+	return s, tmp, nil
 }

@@ -1,12 +1,17 @@
 package supervisor
 
 import (
+	"flag"
 	"os"
 	"sort"
 	"testing"
 
-	"github.com/docker/containerd/runtime"
-	"github.com/docker/containerd/specs"
+	"github.com/containerd/containerd/runtime"
+	"github.com/containerd/containerd/specs"
+)
+
+var (
+	runtimeTool = flag.String("runtime", "runc", "Runtime to use for this test")
 )
 
 type testProcess struct {
@@ -15,6 +20,10 @@ type testProcess struct {
 
 func (p *testProcess) ID() string {
 	return p.id
+}
+
+func (p *testProcess) Start() error {
+	return nil
 }
 
 func (p *testProcess) CloseStdin() error {
@@ -37,8 +46,8 @@ func (p *testProcess) ExitFD() int {
 	return -1
 }
 
-func (p *testProcess) ExitStatus() (int, error) {
-	return -1, nil
+func (p *testProcess) ExitStatus() (uint32, error) {
+	return runtime.UnknownStatus, nil
 }
 
 func (p *testProcess) Container() runtime.Container {
@@ -61,8 +70,7 @@ func (p *testProcess) State() runtime.State {
 	return runtime.Running
 }
 
-func (p *testProcess) Start() error {
-	return nil
+func (p *testProcess) Wait() {
 }
 
 func TestSortProcesses(t *testing.T) {

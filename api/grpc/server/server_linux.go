@@ -3,9 +3,9 @@ package server
 import (
 	"fmt"
 
-	"github.com/docker/containerd/api/grpc/types"
-	"github.com/docker/containerd/specs"
-	"github.com/docker/containerd/supervisor"
+	"github.com/containerd/containerd/api/grpc/types"
+	"github.com/containerd/containerd/specs"
+	"github.com/containerd/containerd/supervisor"
 	"github.com/opencontainers/runc/libcontainer/system"
 	ocs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/net/context"
@@ -25,12 +25,18 @@ func (s *apiServer) AddProcess(ctx context.Context, r *types.AddProcessRequest) 
 		GID:            r.User.Gid,
 		AdditionalGids: r.User.AdditionalGids,
 	}
-	process.Capabilities = r.Capabilities
+	// for backwards compat in the API set eibp
+	process.Capabilities = &ocs.LinuxCapabilities{
+		Bounding:    r.Capabilities,
+		Effective:   r.Capabilities,
+		Inheritable: r.Capabilities,
+		Permitted:   r.Capabilities,
+	}
 	process.ApparmorProfile = r.ApparmorProfile
 	process.SelinuxLabel = r.SelinuxLabel
 	process.NoNewPrivileges = r.NoNewPrivileges
 	for _, rl := range r.Rlimits {
-		process.Rlimits = append(process.Rlimits, ocs.Rlimit{
+		process.Rlimits = append(process.Rlimits, ocs.LinuxRlimit{
 			Type: rl.Type,
 			Soft: rl.Soft,
 			Hard: rl.Hard,
@@ -50,10 +56,11 @@ func (s *apiServer) AddProcess(ctx context.Context, r *types.AddProcessRequest) 
 	e.Stdout = r.Stdout
 	e.Stderr = r.Stderr
 	e.StartResponse = make(chan supervisor.StartResponse, 1)
+	e.Ctx = ctx
 	s.sv.SendTask(e)
 	if err := <-e.ErrorCh(); err != nil {
 		return nil, err
 	}
-	<-e.StartResponse
-	return &types.AddProcessResponse{}, nil
+	sr := <-e.StartResponse
+	return &types.AddProcessResponse{SystemPid: uint32(sr.ExecPid)}, nil
 }
