@@ -35,6 +35,9 @@ all: client daemon shim
 
 static: client-static daemon-static shim-static
 
+# pure Go (no cgo), so static binaries cross compile with just GOARCH
+client-static daemon-static shim-static: export CGO_ENABLED=0
+
 bin:
 	mkdir -p bin/
 

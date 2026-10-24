@@ -2,9 +2,6 @@
 
 package console
 
-// #include <termios.h>
-import "C"
-
 import (
 	"os"
 	"unsafe"
@@ -91,8 +88,8 @@ func (m *master) SetRaw() error {
 	if err != nil {
 		return err
 	}
-	C.cfmakeraw((*C.struct_termios)(unsafe.Pointer(&rawState)))
-	rawState.Oflag = rawState.Oflag | C.OPOST
+	cfmakeraw(&rawState)
+	rawState.Oflag = rawState.Oflag | unix.OPOST
 	return tcset(m.f.Fd(), &rawState)
 }
 
@@ -130,4 +127,15 @@ func newMaster(f *os.File) Console {
 	return &master{
 		f: f,
 	}
+}
+
+// cfmakeraw is the pure Go equivalent of cfmakeraw(3), so no cgo is needed
+func cfmakeraw(t *unix.Termios) {
+	t.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP | unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON
+	t.Oflag &^= unix.OPOST
+	t.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.ISIG | unix.IEXTEN
+	t.Cflag &^= unix.CSIZE | unix.PARENB
+	t.Cflag |= unix.CS8
+	t.Cc[unix.VMIN] = 1
+	t.Cc[unix.VTIME] = 0
 }
